@@ -21,3 +21,5 @@ CLAUDE.md
 components/badgeteam__badgelink/
 .vscode
 badgelink
+.claude/
+floppy_meta.json
