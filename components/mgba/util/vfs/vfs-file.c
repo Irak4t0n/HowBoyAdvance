@@ -10,11 +10,21 @@
 #include <errno.h>
 #include <stdio.h>
 
+#ifdef ESP_PLATFORM
+#include "esp_heap_caps.h"
+#include <fcntl.h>
+#include <unistd.h>
+#include "esp_log.h"
+#include "esp_timer.h"
+#endif
+
 struct VFileFILE {
 	struct VFile d;
 	FILE* file;
 	bool writable;
 };
+
+struct VFile* VFileFromFILE(FILE* file);
 
 static bool _vffClose(struct VFile* vf);
 static off_t _vffSeek(struct VFile* vf, off_t offset, int whence);
@@ -93,13 +103,68 @@ static void* _vffMap(struct VFile* vf, size_t size, int flags) {
 	if (flags & MAP_WRITE) {
 		vff->writable = true;
 	}
+#ifdef ESP_PLATFORM
+	// Fast path: allocate without zero-fill (we read the file into it right away)
+	void* mem = NULL;
+	if (size >= 64 * 1024) {
+		mem = heap_caps_malloc(size, MALLOC_CAP_SPIRAM);
+	}
+	if (!mem) {
+		mem = malloc(size);
+	}
+#else
 	void* mem = anonymousMemoryMap(size);
+#endif
 	if (!mem) {
 		return 0;
 	}
 	long pos = ftell(vff->file);
 	fseek(vff->file, 0, SEEK_SET);
+#ifdef ESP_PLATFORM
+	// Stage through internal RAM to avoid SD+PSRAM bus contention
+	{
+		int64_t t0 = esp_timer_get_time();
+		int fd = fileno(vff->file);
+		lseek(fd, 0, SEEK_SET);
+		#define MAP_READ_CHUNK (128 * 1024)
+		// Staging buffer in internal RAM — SD reads here, then memcpy to PSRAM
+		uint8_t *stage = heap_caps_malloc(MAP_READ_CHUNK, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
+		if (!stage) stage = heap_caps_malloc(MAP_READ_CHUNK, MALLOC_CAP_INTERNAL);
+		uint8_t *dst = (uint8_t *)mem;
+		size_t remaining = size;
+		if (stage) {
+			while (remaining > 0) {
+				size_t chunk = remaining > MAP_READ_CHUNK ? MAP_READ_CHUNK : remaining;
+				ssize_t got = read(fd, stage, chunk);
+				if (got <= 0) {
+					memset(dst, 0, remaining);
+					break;
+				}
+				memcpy(dst, stage, got);
+				dst += got;
+				remaining -= got;
+			}
+			free(stage);
+		} else {
+			// Fallback: direct read
+			while (remaining > 0) {
+				size_t chunk = remaining > MAP_READ_CHUNK ? MAP_READ_CHUNK : remaining;
+				ssize_t got = read(fd, dst, chunk);
+				if (got <= 0) {
+					memset(dst, 0, remaining);
+					break;
+				}
+				dst += got;
+				remaining -= got;
+			}
+		}
+		int64_t dt = esp_timer_get_time() - t0;
+		ESP_LOGI("vfs-map", "Read %u bytes in %lld ms (%.1f MB/s)",
+			(unsigned)size, dt / 1000, (float)size / dt);
+	}
+#else
 	fread(mem, size, 1, vff->file);
+#endif
 	fseek(vff->file, pos, SEEK_SET);
 	return mem;
 }

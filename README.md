@@ -9,16 +9,19 @@ Sister project to [HowBoyMatsu](https://github.com/Irak4t0n/HowBoyMatsu) (Game B
 - **SoC**: ESP32-P4 (400MHz dual-core RISC-V)
 - **RAM**: 32MB PSRAM
 - **Flash**: 16MB
-- **Display**: 800x480 MIPI DSI
-- **Input**: QWERTY keyboard + navigation keys
+- **Display**: 800x480 MIPI DSI (portrait 480x800, rotated 90 CW for landscape)
 
 ## Emulator
 
 Uses [mGBA](https://mgba.io/) 0.10.4 core for GBA emulation.
 
-- GBA screen (240x160) scaled 2x → 480x320, centered on 800x480
+- GBA screen (240x160) scaled to full 800x480 landscape display
+  - 240 columns mapped to 800 rows (3.33x, pattern: 4-3-3 repeating)
+  - 160 rows mapped to 480 columns (3x uniform)
 - Software renderer, 32-bit color converted to RGB888 for PAX display
-- Save files stored on SD card
+- Frame skipping (1 skip per rendered frame) for improved performance
+- Optimized ROM loading: staged reads through internal DMA RAM (~7 MB/s)
+- Save files stored on SD card at `/sdcard/saves/`
 
 ## Controls
 
@@ -48,18 +51,31 @@ make prepare
 make build DEVICE=tanmatsu
 
 # Upload (put Tanmatsu in badgelink mode first)
+make install DEVICE=tanmatsu
+
+# Or manually:
 cd badgelink/tools && source .venv/bin/activate && \
-sudo python badgelink.py appfs upload application "HowBoyAdvance" 0 ../../build/tanmatsu/application.bin
+python badgelink.py appfs upload howboyadvance "HowBoyAdvance" 0 ../../build/tanmatsu/application.bin
 
 # Monitor serial output
-cd ~/HowBoyAdvance && sudo chmod 666 /dev/ttyACM0 && make monitor DEVICE=tanmatsu PORT=/dev/ttyACM0
+make monitor DEVICE=tanmatsu PORT=/dev/ttyACM0
 ```
+
+Windows users can also use `build.bat` and `upload.bat` helpers.
+
+## Architecture
+
+- **main/main.c** - Application entry point, ROM loading, emulation loop, input handling, display scaling
+- **components/mgba/** - mGBA 0.10.4 core (ARM/Thumb CPU, GBA hardware emulation, software renderer)
+  - `util/vfs/vfs-file.c` - Virtual filesystem with optimized staged SD card reads
+  - `util/memory.c` - Memory allocation routing large buffers to PSRAM
+  - `gb/audio.c` - GB audio (PSG shared by GBA audio subsystem)
 
 ## Known Issues
 
 - Always delete `build/tanmatsu/esp-idf/main/libmain.a` before rebuilding to force recompilation
-- ROM files must be actual non-zero byte files on the SD card
-- `ftell()` can return 0 on FAT filesystem — the loader uses a chunk-reading fallback
+- 32MB ROMs do not fit in PSRAM (16MB and smaller work fine)
+- FPS varies by scene complexity (~26-64 FPS with frame skipping)
 
 ## License
 

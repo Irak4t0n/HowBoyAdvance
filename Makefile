@@ -61,11 +61,11 @@ badgelink:
 .PHONY: install
 install: build
 install:
-	cd badgelink/tools; ./badgelink.sh appfs upload application "template application" 0 ../../$(BUILD)/application.bin
+	cd badgelink/tools; ./badgelink.sh appfs upload howboyadvance "HowBoyAdvance" 0 ../../$(BUILD)/application.bin
 
 .PHONY: run
 run:
-	cd badgelink/tools; ./badgelink.sh start application
+	cd badgelink/tools; ./badgelink.sh start howboyadvance
 
 # Preparation
 

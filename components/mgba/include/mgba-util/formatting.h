@@ -14,13 +14,15 @@ CXX_GUARD_START
 
 #ifdef HAVE_XLOCALE
 #include <xlocale.h>
+#elif defined(ESP_PLATFORM)
+/* ESP-IDF newlib provides locale_t and strtof_l natively */
 #elif !defined(HAVE_LOCALE)
 typedef const char* locale_t;
 #endif
 
 int ftostr_l(char* restrict str, size_t size, float f, locale_t locale);
 
-#ifndef HAVE_STRTOF_L
+#if !defined(HAVE_STRTOF_L) && !defined(ESP_PLATFORM)
 float strtof_l(const char* restrict str, char** restrict end, locale_t locale);
 #endif
 

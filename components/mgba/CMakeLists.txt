@@ -27,6 +27,9 @@ idf_component_register(
     "core/timing.c"
     "core/version.c"
 
+    # GB shared audio (used by GBA audio PSG)
+    "gb/audio.c"
+
     # GBA emulation
     "gba/audio.c"
     "gba/bios.c"
@@ -50,6 +53,7 @@ idf_component_register(
     "gba/renderers/software-bg.c"
     "gba/renderers/software-mode0.c"
     "gba/renderers/software-obj.c"
+    "gba/renderers/cache-set.c"
     "gba/renderers/video-software.c"
     "gba/savedata.c"
     "gba/serialize.c"
@@ -97,15 +101,19 @@ idf_component_register(
 
   PRIV_REQUIRES
     newlib
+    esp_timer
 )
 
 # Core defines for minimal embedded build
 target_compile_definitions(${COMPONENT_LIB} PUBLIC
   MINIMAL_CORE=2
   M_CORE_GBA
+  USE_VFS_FILE
   DISABLE_THREADING
   BUILD_STATIC
   HAVE_LOCALTIME_R
+  HAVE_LOCALE
+  HAVE_STRTOF_L
   HAVE_STRDUP
   _GNU_SOURCE
 )

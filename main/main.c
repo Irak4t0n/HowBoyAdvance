@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdarg.h>
+#include <errno.h>
 #include "bsp/device.h"
 #include "bootloader_common.h"
 #include "esp_system.h"
@@ -11,7 +12,6 @@
 #include "esp_lcd_panel_ops.h"
 #include "esp_lcd_types.h"
 #include "esp_log.h"
-#include "hal/lcd_types.h"
 #include "nvs_flash.h"
 #include "pax_fonts.h"
 #include "pax_gfx.h"
@@ -31,6 +31,7 @@
 
 // mGBA headers
 #include <mgba/core/core.h>
+#include <mgba/core/log.h>
 #include <mgba/core/serialize.h>
 #include <mgba/core/blip_buf.h>
 #include <mgba/gba/core.h>
@@ -43,13 +44,12 @@ static char const TAG[] = "howboy";
 
 #define GBA_WIDTH   240
 #define GBA_HEIGHT  160
-#define PHYS_W      480   // landscape width  (display is 800x480 portrait, rotated)
-#define PHYS_H      800   // landscape height
-#define SCALE       2     // 240*2=480, 160*2=320 — fits in 800x480
-#define SCALED_W    (GBA_WIDTH  * SCALE)  // 480
-#define SCALED_H    (GBA_HEIGHT * SCALE)  // 320
-#define OFFSET_X    0                          // (800 - 480) / 2 ... but we center vertically in landscape
-#define OFFSET_Y    ((PHYS_H - SCALED_H) / 2) // (800 - 320) / 2 = 240
+#define PHYS_W      480   // portrait width  (physical display columns)
+#define PHYS_H      800   // portrait height (physical display rows)
+// After CW rotation: landscape is 800 wide × 480 tall
+#define LAND_W      PHYS_H  // 800
+#define LAND_H      PHYS_W  // 480
+// GBA 240×160 → 800×480 fill: Y is 3x exact, X is 3.33x (80 of 240 get 4 rows)
 
 #define ROMS_DIR    "/sdcard/roms"
 #define SAVES_DIR   "/sdcard/saves"
@@ -71,16 +71,7 @@ static QueueHandle_t              input_event_queue    = NULL;
 static struct mCore *core = NULL;
 static color_t      *gba_fb = NULL;  // mGBA renders into this (32-bit XBGR)
 
-// Display double-buffer (PAX format: landscape 800x480, written as portrait 480x800)
-static uint8_t *render_buf_a = NULL;
-static uint8_t *render_buf_b = NULL;
-static int      active_buf   = 0;
-
-// Task sync
-static SemaphoreHandle_t sem_frame_ready  = NULL;
-static SemaphoreHandle_t sem_frame_done   = NULL;
-static SemaphoreHandle_t sem_emulator_done = NULL;
-static TaskHandle_t      blit_task_handle  = NULL;
+// Task handles
 static TaskHandle_t      emulator_task_handle = NULL;
 
 // Input state
@@ -98,48 +89,6 @@ static void restart_to_launcher(void) {
 
 static void blit(void) {
     bsp_display_blit(0, 0, display_h_res, display_v_res, pax_buf_get_pixels(&fb_pax));
-}
-
-// Read ROM from SD using chunk loop (ftell can return 0 on FAT)
-static uint8_t *load_rom_file(const char *path, size_t *out_size) {
-    FILE *f = fopen(path, "rb");
-    if (!f) return NULL;
-
-    // Try ftell first
-    fseek(f, 0, SEEK_END);
-    size_t sz = (size_t)ftell(f);
-    fseek(f, 0, SEEK_SET);
-
-    if (sz == 0) {
-        // ftell failed on FAT — read in chunks
-        size_t cap = 256 * 1024;
-        uint8_t *buf = heap_caps_malloc(cap, MALLOC_CAP_SPIRAM);
-        if (!buf) { fclose(f); return NULL; }
-        sz = 0;
-        while (1) {
-            if (sz >= cap) {
-                cap *= 2;
-                uint8_t *nb = heap_caps_malloc(cap, MALLOC_CAP_SPIRAM);
-                if (!nb) { free(buf); fclose(f); return NULL; }
-                memcpy(nb, buf, sz);
-                free(buf);
-                buf = nb;
-            }
-            size_t r = fread(buf + sz, 1, cap - sz, f);
-            if (r == 0) break;
-            sz += r;
-        }
-        fclose(f);
-        *out_size = sz;
-        return buf;
-    }
-
-    uint8_t *buf = heap_caps_malloc(sz, MALLOC_CAP_SPIRAM);
-    if (!buf) { fclose(f); return NULL; }
-    fread(buf, 1, sz, f);
-    fclose(f);
-    *out_size = sz;
-    return buf;
 }
 
 // Find first .gba ROM in ROMS_DIR
@@ -160,67 +109,47 @@ static const char *find_rom(void) {
     return NULL;
 }
 
-// ── Scale GBA framebuffer to display ──────────────────────────────────────────
+// ── Scale GBA framebuffer into PAX buffer and blit ───────────────────────────
 
-// mGBA outputs 32-bit color_t (XBGR8 on little-endian: 0x00BBGGRR).
-// PAX buffer is RGB888 (3 bytes per pixel, R-G-B order) in portrait layout.
-// The display is physically 480w x 800h portrait, but we treat it as 800x480 landscape
-// via PAX rotation. We write directly into the render buffer in portrait coords.
-//
-// Portrait mapping: pixel at landscape (lx, ly) maps to portrait (row, col):
-//   row = lx,  col = (PHYS_H - 1) - ly   (for 90° CW rotation)
+// Following HowBoyMatsu's full-screen fill approach:
+// GBA X (240) → 800 physical rows (3.33x: every 3rd gx gets 4 rows, rest get 3)
+// GBA Y (160, reversed) → 480 physical columns (3x exact)
 
-static void scale_gba_to_render_buf(void) {
-    uint8_t *dst = active_buf ? render_buf_b : render_buf_a;
-    const int bpp = 3;  // RGB888 = 3 bytes per pixel
-    const int row_stride = PHYS_H * bpp;  // portrait: 800 pixels wide * 3 bytes
+static void scale_and_blit(void) {
+    uint8_t *dst = (uint8_t *)pax_buf_get_pixels(&fb_pax);
+    const int bpp = 3;
+    const int stride = PHYS_W * bpp;  // 480 * 3 = 1440 bytes per physical row
 
-    // Clear the border regions (top/bottom bars in landscape = left/right in portrait)
-    // Only need to do this once, but it's cheap enough
-    // The OFFSET_Y pixels at top and bottom in landscape map to columns in portrait
+    uint8_t scaled_row[PHYS_W * 3];
+    int row = 0;
 
-    // Scale 2x: each GBA pixel becomes a 2x2 block
-    for (int gy = 0; gy < GBA_HEIGHT; gy++) {
-        for (int gx = 0; gx < GBA_WIDTH; gx++) {
+    for (int gx = 0; gx < GBA_WIDTH; gx++) {
+        // Build scaled row: GBA Y reversed → 480 physical columns (3x exact)
+        uint8_t *rp = scaled_row;
+
+        for (int gy = GBA_HEIGHT - 1; gy >= 0; gy--) {
             color_t c = gba_fb[gy * GBA_WIDTH + gx];
-            // mGBA XBGR8: bits [7:0]=R, [15:8]=G, [23:16]=B
             uint8_t r = c & 0xFF;
             uint8_t g = (c >> 8) & 0xFF;
             uint8_t b = (c >> 16) & 0xFF;
-
-            // Landscape coords of scaled pixel
-            int lx0 = gx * SCALE;           // 0..478
-            int ly0 = OFFSET_Y + gy * SCALE; // 240..559
-
-            // Write 2x2 block
-            for (int dy = 0; dy < SCALE; dy++) {
-                int ly = ly0 + dy;
-                // Portrait coords: row = lx, col = (PHYS_H-1) - ly
-                int col = (PHYS_H - 1) - ly;
-                for (int dx = 0; dx < SCALE; dx++) {
-                    int lx = lx0 + dx;
-                    int row = lx;
-                    int off = row * row_stride + col * bpp;
-                    dst[off + 0] = r;
-                    dst[off + 1] = g;
-                    dst[off + 2] = b;
-                }
-            }
+            // 3x column scale
+            rp[0] = r; rp[1] = g; rp[2] = b;
+            rp[3] = r; rp[4] = g; rp[5] = b;
+            rp[6] = r; rp[7] = g; rp[8] = b;
+            rp += 9;
         }
+
+        // Row scale: 3 or 4 rows (800/240 = 3.33x, every 3rd gx gets 4)
+        int row_count = (gx % 3 == 0) ? 4 : 3;
+        uint8_t *row_dst = dst + row * stride;
+        for (int rep = 0; rep < row_count; rep++) {
+            memcpy(row_dst, scaled_row, stride);
+            row_dst += stride;
+        }
+        row += row_count;
     }
-}
 
-// ── Blit task (Core 0) ───────────────────────────────────────────────────────
-
-static void blit_task(void *arg) {
-    while (1) {
-        xSemaphoreTake(sem_frame_ready, portMAX_DELAY);
-
-        uint8_t *buf = active_buf ? render_buf_b : render_buf_a;
-        bsp_display_blit(0, 0, PHYS_W, PHYS_H, buf);
-
-        xSemaphoreGive(sem_frame_done);
-    }
+    bsp_display_blit(0, 0, display_h_res, display_v_res, pax_buf_get_pixels(&fb_pax));
 }
 
 // ── Input handling ────────────────────────────────────────────────────────────
@@ -238,12 +167,12 @@ static void blit_task(void *arg) {
 #define GBA_KEY_L      (1 << 9)
 
 static void poll_input(void) {
+    // Handle navigation events (d-pad + F1) from the event queue
     bsp_input_event_t ev;
     while (xQueueReceive(input_event_queue, &ev, 0) == pdTRUE) {
-        uint32_t bit = 0;
-        bool handled = false;
-
         if (ev.type == INPUT_EVENT_TYPE_NAVIGATION) {
+            uint32_t bit = 0;
+            bool handled = false;
             switch (ev.args_navigation.key) {
                 case BSP_INPUT_NAVIGATION_KEY_UP:    bit = GBA_KEY_UP;    handled = true; break;
                 case BSP_INPUT_NAVIGATION_KEY_DOWN:  bit = GBA_KEY_DOWN;  handled = true; break;
@@ -261,34 +190,16 @@ static void poll_input(void) {
                     gba_keys &= ~bit;
             }
         }
-        else if (ev.type == INPUT_EVENT_TYPE_KEYBOARD) {
-            char c = ev.args_keyboard.ascii;
-            bool pressed = (ev.args_keyboard.modifiers & 0x01) || (c != 0); // key event
-            // For keyboard events, we get press only — track via scancode instead
-            // Actually keyboard events come as characters, we need scancode for release detection
-        }
-        else if (ev.type == INPUT_EVENT_TYPE_SCANCODE) {
-            uint32_t sc = ev.args_scancode.scancode;
-            bool pressed = (ev.args_scancode.state != 0);
-            // Tanmatsu keyboard scancodes for QWERTY keys
-            // x=A, z=B, q=L, e=R, Enter=Start, Space=Select
-            switch (sc) {
-                case 0x1B: bit = GBA_KEY_A;      break; // x
-                case 0x1A: bit = GBA_KEY_B;      break; // z
-                case 0x14: bit = GBA_KEY_L;      break; // q
-                case 0x08: bit = GBA_KEY_R;      break; // e
-                case 0x28: bit = GBA_KEY_START;  break; // Enter
-                case 0x2C: bit = GBA_KEY_SELECT; break; // Space
-                default: break;
-            }
-            if (bit) {
-                if (pressed)
-                    gba_keys |= bit;
-                else
-                    gba_keys &= ~bit;
-            }
-        }
     }
+
+    // Poll keyboard keys by scancode — accurate press/release, no repeat flicker
+    bool st;
+    bsp_input_read_scancode(BSP_INPUT_SCANCODE_X,     &st); if (st) gba_keys |= GBA_KEY_A;      else gba_keys &= ~GBA_KEY_A;
+    bsp_input_read_scancode(BSP_INPUT_SCANCODE_Z,     &st); if (st) gba_keys |= GBA_KEY_B;      else gba_keys &= ~GBA_KEY_B;
+    bsp_input_read_scancode(BSP_INPUT_SCANCODE_Q,     &st); if (st) gba_keys |= GBA_KEY_L;      else gba_keys &= ~GBA_KEY_L;
+    bsp_input_read_scancode(BSP_INPUT_SCANCODE_E,     &st); if (st) gba_keys |= GBA_KEY_R;      else gba_keys &= ~GBA_KEY_R;
+    bsp_input_read_scancode(BSP_INPUT_SCANCODE_ENTER, &st); if (st) gba_keys |= GBA_KEY_START;  else gba_keys &= ~GBA_KEY_START;
+    bsp_input_read_scancode(BSP_INPUT_SCANCODE_SPACE, &st); if (st) gba_keys |= GBA_KEY_SELECT; else gba_keys &= ~GBA_KEY_SELECT;
 }
 
 // ── mGBA logging callback ─────────────────────────────────────────────────────
@@ -358,18 +269,6 @@ sd_ready:;
     pax_draw_text(&fb_pax, 0xFFFFFF00, pax_font_sky_mono, 14, 10, 10, "Loading ROM...");
     blit();
 
-    // ── Load ROM into PSRAM ──────────────────────────────────────────────
-    size_t rom_size = 0;
-    uint8_t *rom_data = load_rom_file(rom_path, &rom_size);
-    if (!rom_data || rom_size == 0) {
-        ESP_LOGE(TAG, "Failed to load ROM (%u bytes)", (unsigned)rom_size);
-        pax_background(&fb_pax, 0xFF000000);
-        pax_draw_text(&fb_pax, 0xFFFF0000, pax_font_sky_mono, 16, 10, 10, "Failed to load ROM!");
-        blit();
-        goto wait_exit;
-    }
-    ESP_LOGI(TAG, "ROM loaded: %u bytes", (unsigned)rom_size);
-
     // ── Initialize mGBA core ─────────────────────────────────────────────
     mLogSetDefaultLogger(&mgba_logger);
 
@@ -379,9 +278,10 @@ sd_ready:;
         goto wait_exit;
     }
     core->init(core);
+    mCoreInitConfig(core, NULL);
 
-    // Allocate GBA framebuffer in PSRAM (240x160 x 4 bytes)
-    gba_fb = heap_caps_malloc(GBA_WIDTH * GBA_HEIGHT * sizeof(color_t), MALLOC_CAP_SPIRAM);
+    // Allocate GBA framebuffer from internal RAM (150KB — saves PSRAM for ROM)
+    gba_fb = heap_caps_malloc(GBA_WIDTH * GBA_HEIGHT * sizeof(color_t), MALLOC_CAP_INTERNAL);
     if (!gba_fb) {
         ESP_LOGE(TAG, "Failed to allocate GBA framebuffer");
         goto wait_exit;
@@ -389,12 +289,33 @@ sd_ready:;
     memset(gba_fb, 0, GBA_WIDTH * GBA_HEIGHT * sizeof(color_t));
     core->setVideoBuffer(core, gba_fb, GBA_WIDTH);
 
-    // Load ROM via VFile memory wrapper (VFileMemChunk for const/read-only)
-    struct VFile *vf = VFileMemChunk(rom_data, rom_size);
+    // Free PAX buffer to maximize PSRAM for ROM mapping (mGBA maps up to 32MB)
+    ESP_LOGI(TAG, "Free PSRAM before ROM load: %u bytes",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+    pax_buf_destroy(&fb_pax);
+
+    // Load ROM directly from SD card via VFile
+    struct VFile *vf = VFileFOpen(rom_path, "rb");
     if (!vf || !core->loadROM(core, vf)) {
-        ESP_LOGE(TAG, "mGBA failed to load ROM");
+        ESP_LOGE(TAG, "mGBA failed to load ROM (free PSRAM: %u)",
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+        // Re-create PAX buffer for error display
+        pax_buf_init(&fb_pax, NULL, display_h_res, display_v_res, PAX_BUF_24_888RGB);
+        pax_buf_reversed(&fb_pax, display_data_endian == BSP_DISPLAY_ENDIAN_BIG);
+        pax_buf_set_orientation(&fb_pax, PAX_O_ROT_CW);
+        pax_background(&fb_pax, 0xFF000000);
+        pax_draw_text(&fb_pax, 0xFFFF0000, pax_font_sky_mono, 16, 10, 10, "Failed to load ROM!");
+        pax_draw_text(&fb_pax, 0xFFAAAAAA, pax_font_sky_mono, 12, 10, 40, "ROM may be too large for PSRAM");
+        blit();
         goto wait_exit;
     }
+    ESP_LOGI(TAG, "ROM loaded via VFile: %s (free PSRAM: %u)", rom_path,
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+
+    // Re-create PAX buffer for display output
+    pax_buf_init(&fb_pax, NULL, display_h_res, display_v_res, PAX_BUF_24_888RGB);
+    pax_buf_reversed(&fb_pax, display_data_endian == BSP_DISPLAY_ENDIAN_BIG);
+    pax_buf_set_orientation(&fb_pax, PAX_O_ROT_CW);
 
     // Set up save file
     mkdir(SAVES_DIR, 0777);
@@ -419,34 +340,33 @@ sd_ready:;
     pax_background(&fb_pax, 0xFF000000);
     blit();
 
-    // Clear render buffers (black borders)
-    memset(render_buf_a, 0, PHYS_W * PHYS_H * 3);
-    memset(render_buf_b, 0, PHYS_W * PHYS_H * 3);
-
     // ── Main emulation loop ──────────────────────────────────────────────
     {
         int64_t frame_start = esp_timer_get_time();
         int frame_count = 0;
 
+        const int FRAME_SKIP = 1;  // run N extra frames without rendering
+
         while (1) {
             poll_input();
             core->setKeys(core, gba_keys);
+
+            // Run skipped frames (no render)
+            for (int i = 0; i < FRAME_SKIP; i++) {
+                core->runFrame(core);
+            }
+            // Run + render frame
             core->runFrame(core);
+            scale_and_blit();
 
-            // Wait for previous blit to finish, then scale into the back buffer
-            xSemaphoreTake(sem_frame_done, portMAX_DELAY);
-            scale_gba_to_render_buf();
-            active_buf ^= 1;
-            xSemaphoreGive(sem_frame_ready);
-
-            // FPS counter
-            frame_count++;
+            // FPS counter (counts emulated frames, not rendered)
+            frame_count += FRAME_SKIP + 1;
             int64_t now = esp_timer_get_time();
             if (now - frame_start >= 1000000) {
                 fps_val = frame_count;
                 frame_count = 0;
                 frame_start = now;
-                ESP_LOGI(TAG, "FPS: %d", fps_val);
+                ESP_LOGI(TAG, "FPS: %d (skip %d)", fps_val, FRAME_SKIP);
             }
         }
     }
@@ -502,7 +422,7 @@ void app_main(void) {
         default: break;
     }
     pax_buf_init(&fb_pax, NULL, display_h_res, display_v_res, format);
-    pax_buf_reversed(&fb_pax, display_data_endian == LCD_RGB_DATA_ENDIAN_BIG);
+    pax_buf_reversed(&fb_pax, display_data_endian == BSP_DISPLAY_ENDIAN_BIG);
     pax_buf_set_orientation(&fb_pax, orientation);
 
     ESP_ERROR_CHECK(bsp_input_get_queue(&input_event_queue));
@@ -516,22 +436,6 @@ void app_main(void) {
     blit();
     vTaskDelay(pdMS_TO_TICKS(500));
 
-    // Allocate render double-buffers in PSRAM (portrait: 480x800x3 = 1.152 MB each)
-    size_t buf_sz = PHYS_W * PHYS_H * 3;  // RGB888
-    render_buf_a = (uint8_t *)heap_caps_malloc(buf_sz, MALLOC_CAP_SPIRAM);
-    render_buf_b = (uint8_t *)heap_caps_malloc(buf_sz, MALLOC_CAP_SPIRAM);
-    if (!render_buf_a || !render_buf_b) {
-        ESP_LOGE(TAG, "Failed to allocate render buffers");
-        return;
-    }
-    memset(render_buf_a, 0, buf_sz);
-    memset(render_buf_b, 0, buf_sz);
-
-    sem_frame_ready = xSemaphoreCreateBinary();
-    sem_frame_done  = xSemaphoreCreateBinary();
-    xSemaphoreGive(sem_frame_done);
-
-    xTaskCreatePinnedToCore(blit_task, "blit", 8192, NULL, 5, &blit_task_handle, 0);
     xTaskCreatePinnedToCore(emulator_task, "emulator", 32768, NULL, 5, &emulator_task_handle, 1);
 
     // Main task can idle — emulator runs on Core 1, blit on Core 0
