@@ -6,7 +6,7 @@ Sister project to [HowBoyMatsu](https://github.com/Irak4t0n/HowBoyMatsu) (Game B
 
 ## Hardware
 
-- **SoC**: ESP32-P4 (400MHz dual-core RISC-V)
+- **SoC**: ESP32-P4 (360MHz dual-core RISC-V)
 - **RAM**: 32MB PSRAM
 - **Flash**: 16MB
 - **Display**: 800x480 MIPI DSI (portrait 480x800, rotated 90 CW for landscape)
@@ -18,8 +18,10 @@ Uses [mGBA](https://mgba.io/) 0.10.4 core for GBA emulation.
 - GBA screen (240x160) scaled to full 800x480 landscape display
   - 240 columns mapped to 800 rows (3.33x, pattern: 4-3-3 repeating)
   - 160 rows mapped to 480 columns (3x uniform)
-- Software renderer, 32-bit color converted to RGB888 for PAX display
-- Frame skipping (1 skip per rendered frame) for improved performance
+- Software renderer, 32-bit color converted to RGB565 for display
+- mGBA built-in frameskip (1 skip per rendered frame) — renderer bypassed on skip frames
+- Idle loop detection auto-detects and fast-forwards CPU idle waits
+- Dual-core pipeline: Core 1 emulates, Core 0 scales + blits in parallel
 - Optimized ROM loading: staged reads through internal DMA RAM (~7 MB/s)
 - Save files stored on SD card at `/sdcard/saves/`
 
@@ -75,7 +77,7 @@ Windows users can also use `build.bat` and `upload.bat` helpers.
 
 - Always delete `build/tanmatsu/esp-idf/main/libmain.a` before rebuilding to force recompilation
 - 32MB ROMs do not fit in PSRAM (16MB and smaller work fine)
-- FPS varies by scene complexity (~26-64 FPS with frame skipping)
+- FPS varies by scene complexity (~30-76 emulated FPS, ~15-38 displayed)
 
 ## License
 

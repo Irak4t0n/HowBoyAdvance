@@ -121,7 +121,7 @@ target_compile_definitions(${COMPONENT_LIB} PUBLIC
 # Suppress warnings in third-party code; optimize for size
 target_compile_options(${COMPONENT_LIB} PRIVATE
   -w
-  -Os
+  -O2
   -ffunction-sections
   -fdata-sections
 )

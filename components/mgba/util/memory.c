@@ -11,13 +11,21 @@
 
 void* anonymousMemoryMap(size_t size) {
 #ifdef ESP_PLATFORM
-	// Use PSRAM for large allocations (ROM data), internal RAM for small ones
+	// Push buffers >= 64KB to PSRAM (EWRAM 256KB, VRAM 96KB, ROM 16MB+).
+	// Keeping threshold at 64KB ensures the 128KB DMA staging buffer
+	// (used for fast ROM loading) can be allocated from internal RAM.
 	if (size >= 64 * 1024) {
 		void *p = heap_caps_malloc(size, MALLOC_CAP_SPIRAM);
 		if (p) {
 			memset(p, 0, size);
 			return p;
 		}
+	}
+	// Internal RAM for smaller allocations (IWRAM 32KB, palette, OAM)
+	void *p = heap_caps_malloc(size, MALLOC_CAP_INTERNAL);
+	if (p) {
+		memset(p, 0, size);
+		return p;
 	}
 #endif
 	return calloc(1, size);
