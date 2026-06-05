@@ -20,37 +20,32 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
+
 #include "esp_vfs_fat.h"
+#include "esp_cache.h"
 #include "sdmmc_cmd.h"
 #include "driver/sdmmc_host.h"
 #include "targets/tanmatsu/tanmatsu_hardware.h"
 #include "esp_heap_caps.h"
-#include "dirent.h"
 #include "sys/stat.h"
 #include "esp_timer.h"
+#include "bsp/audio.h"
+#include "driver/i2s_std.h"
+#include "driver/ppa.h"
+#include "esp_cache.h"
+#include "esp_pm.h"
 
-// mGBA headers
-#include <mgba/core/core.h>
-#include <mgba/core/log.h>
-#include <mgba/core/serialize.h>
-#include <mgba/core/blip_buf.h>
-#include <mgba/gba/core.h>
-#include <mgba/gba/interface.h>
-#include <mgba-util/vfs.h>
+// gpSP headers
+#include "gpsp_esp.h"
+#include "rom_selector.h"
+#include "config.h"
+#include "menu.h"
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 static char const TAG[] = "howboy";
 
-#define GBA_WIDTH   240
-#define GBA_HEIGHT  160
-#define PHYS_W      480   // portrait width  (physical display columns)
-#define PHYS_H      800   // portrait height (physical display rows)
-#define LAND_W      PHYS_H  // 800
-#define LAND_H      PHYS_W  // 480
-
-#define ROMS_DIR    "/sdcard/roms"
-#define SAVES_DIR   "/sdcard/saves"
+// ROMS_DIR and SAVES_DIR defined in rom_selector.h
 
 // ── Global state ──────────────────────────────────────────────────────────────
 
@@ -58,12 +53,11 @@ static size_t                     display_h_res        = 0;
 static size_t                     display_v_res        = 0;
 static bsp_display_color_format_t display_color_format = 0;
 static bsp_display_endianness_t   display_data_endian  = 0;
-static pax_buf_t                  fb_pax               = {0};
-static QueueHandle_t              input_event_queue    = NULL;
+pax_buf_t                  fb_pax               = {0};
+QueueHandle_t              input_event_queue    = NULL;
 
-// mGBA core
-static struct mCore *core = NULL;
-static color_t      *gba_fb = NULL;
+// gpSP framebuffer pointer (owned by gpSP)
+static uint16_t *gba_fb = NULL;
 
 // Task handles
 static TaskHandle_t      emulator_task_handle = NULL;
@@ -73,100 +67,306 @@ static volatile uint32_t gba_keys = 0;
 
 // FPS tracking
 static volatile int fps_val = 0;
+static volatile bool show_fps = false;
 
-// Forward declaration (defined further below)
-static void scale_frame(uint16_t *dst);
+// Audio pipeline
+#define AUDIO_SAMPLE_RATE   65536  // gpSP native: GBA_SOUND_FREQUENCY = 64*1024
+#define AUDIO_FRAMES_PER_VBLANK 1097  // 65536 / 59.7275 ≈ 1097 stereo frames per GBA frame
+#define AUDIO_DRAIN_MAX     1200  // slightly over one frame's worth
 
-// Scale+blit pipeline: Core 0 scales gba_fb and blits while Core 1 emulates
-static uint8_t          *render_buf[2] = {NULL, NULL};
-static SemaphoreHandle_t sem_frame_ready = NULL;  // Core 1 → Core 0: gba_fb has new frame
-static SemaphoreHandle_t sem_scale_done  = NULL;  // Core 0 → Core 1: done reading gba_fb
+static int16_t             *audio_buf_a  = NULL;
+static int16_t             *audio_buf_b  = NULL;
+static volatile int         audio_buf_len = 0;
+static volatile int         audio_buf_ready = 0;
+static SemaphoreHandle_t    sem_audio_ready = NULL;
+static SemaphoreHandle_t    sem_audio_done  = NULL;
+static volatile int         audio_samples_produced = 0;
+static float                volume_level = 50.0f;
+static volatile int         audio_mute = 0;
+
+// Fast forward
+static volatile int  ff_speed = 0;
+
+// Button layout: 0 = Default (A/D = A/B), 1 = WASD (WASD = d-pad, ;/[ = A/B)
+static volatile int  key_layout = 0;
+static volatile int  layout_menu_open = 0;
+static volatile int  lm_cursor = 0;
+
+// Save path (for autosave + exit save)
+static char sram_path_global[384] = {0};
+static char state_save_dir[384]   = {0};
+
+// Save state buffer (416KB, allocated on-demand to save PSRAM for ROM)
+static void *state_buf = NULL;
+
+
+// PPA hardware scaler
+#define PPA_SCALE_X  3.3125f
+#define PPA_SCALE_Y  3.0f
+#define SCALED_W  480
+#define SCALED_H  795
+#define BORDER_Y  ((PHYS_H - SCALED_H) / 2)
+
+static ppa_client_handle_t ppa_srm_client = NULL;
+static uint8_t          *render_buf[1] = {NULL};
+static SemaphoreHandle_t sem_frame_ready = NULL;
+static SemaphoreHandle_t sem_scale_done  = NULL;
+
+// ── Audio task (Core 0) ──────────────────────────────────────────────────────
+
+static void audio_task(void *arg) {
+    i2s_chan_handle_t i2s = NULL;
+    bsp_audio_get_i2s_handle(&i2s);
+    size_t written;
+    static int16_t silence[2048] = {0};
+
+    while (1) {
+        xSemaphoreTake(sem_audio_ready, portMAX_DELAY);
+        if (audio_mute) {
+            // Write silence to keep I2S DMA flowing (prevents pops on unmute)
+            if (i2s)
+                i2s_channel_write(i2s, silence, audio_buf_len * 2 * sizeof(int16_t),
+                                  &written, pdMS_TO_TICKS(100));
+            xSemaphoreGive(sem_audio_done);
+            continue;
+        }
+        int16_t *buf = (audio_buf_ready == 0) ? audio_buf_a : audio_buf_b;
+        int len = audio_buf_len;
+        if (len > 0 && i2s)
+            i2s_channel_write(i2s, buf, len * 2 * sizeof(int16_t),
+                              &written, pdMS_TO_TICKS(100));
+        xSemaphoreGive(sem_audio_done);
+    }
+}
+
+static void drain_and_submit_audio(void) {
+    if (!audio_buf_a) return;
+    int16_t *buf = (audio_buf_ready == 0) ? audio_buf_b : audio_buf_a;
+
+    if (ff_speed > 0) {
+        // Non-blocking silence during fast-forward
+        if (xSemaphoreTake(sem_audio_done, 0) == pdTRUE) {
+            memset(buf, 0, AUDIO_FRAMES_PER_VBLANK * 2 * sizeof(int16_t));
+            audio_buf_len = AUDIO_FRAMES_PER_VBLANK;
+            audio_buf_ready ^= 1;
+            xSemaphoreGive(sem_audio_ready);
+        }
+        // Drain gpSP audio buffer to prevent buildup
+        int16_t dummy[512];
+        while (gpsp_get_audio(dummy, 256) > 0) {}
+        return;
+    }
+
+    unsigned frames = gpsp_get_audio(buf, AUDIO_FRAMES_PER_VBLANK);
+    // Pad remainder with silence so I2S always gets a full frame — prevents DMA underruns
+    if (frames < AUDIO_FRAMES_PER_VBLANK)
+        memset(buf + frames * 2, 0, (AUDIO_FRAMES_PER_VBLANK - frames) * 2 * sizeof(int16_t));
+    audio_samples_produced += frames;
+    // Block up to 30ms for previous buffer to finish — prevents dropped audio
+    xSemaphoreTake(sem_audio_done, pdMS_TO_TICKS(30));
+    audio_buf_len = AUDIO_FRAMES_PER_VBLANK;
+    audio_buf_ready ^= 1;
+    xSemaphoreGive(sem_audio_ready);
+}
+
+// ── FPS overlay ───────────────────────────────────────────────────────────────
+
+static void draw_fps_overlay(uint8_t *buf) {
+    if (!show_fps || fps_val <= 0) return;
+
+    static const uint8_t fps_font[][5] = {
+        {0x1F,0x11,0x11,0x11,0x1F},{0x00,0x12,0x1F,0x10,0x00}, // 0,1
+        {0x1D,0x15,0x15,0x15,0x17},{0x11,0x15,0x15,0x15,0x1F}, // 2,3
+        {0x07,0x04,0x04,0x04,0x1F},{0x17,0x15,0x15,0x15,0x1D}, // 4,5
+        {0x1F,0x15,0x15,0x15,0x1D},{0x01,0x01,0x01,0x01,0x1F}, // 6,7
+        {0x1F,0x15,0x15,0x15,0x1F},{0x17,0x15,0x15,0x15,0x1F}, // 8,9
+    };
+
+    char fps_str[8];
+    snprintf(fps_str, sizeof(fps_str), "%d", fps_val);
+    int fps_len = (int)strlen(fps_str);
+
+    uint16_t *phys = (uint16_t *)buf;
+    const int SC = 3, start_row = 790;
+
+    for (int ci = 0; ci < fps_len; ci++) {
+        char ch = fps_str[ci];
+        if (ch < '0' || ch > '9') continue;
+        int idx = ch - '0';
+
+        int char_row = start_row - (fps_len - 1 - ci) * 6 * SC;
+        for (int col = 0; col < 5; col++) {
+            uint8_t bits = fps_font[idx][col];
+            for (int row = 0; row < 5; row++) {
+                if (!(bits & (1 << row))) continue;
+                for (int sy = 0; sy < SC; sy++)
+                for (int sx = 0; sx < SC; sx++) {
+                    int px = char_row - (4 - col) * SC - sy;
+                    int py = 4 + (4 - row) * SC + sx;
+                    if (px >= 0 && px < PHYS_H && py >= 0 && py < PHYS_W)
+                        phys[px * PHYS_W + py] = 0xF800;
+                }
+            }
+        }
+    }
+}
 
 // ── Scale+blit task (Core 0) ─────────────────────────────────────────────────
-// Scales gba_fb into render_buf, then blits to display.
-// Runs in parallel with Core 1's skip frame (which doesn't touch gba_fb).
 
 static void blit_task(void *arg) {
-    int cur_buf = 0;
+    size_t fb_bytes = PHYS_W * PHYS_H * sizeof(uint16_t);
     while (1) {
         xSemaphoreTake(sem_frame_ready, portMAX_DELAY);
-        // Scale gba_fb (internal RAM) into render_buf (PSRAM, RGB565)
-        scale_frame((uint16_t *)render_buf[cur_buf]);
-        // Signal Core 1: safe to write gba_fb again (next render frame)
+
+        uint16_t *dst = (uint16_t *)render_buf[0];
+
+        ppa_srm_oper_config_t srm = {
+            .in = {
+                .buffer     = gba_fb,
+                .pic_w      = GBA_WIDTH,
+                .pic_h      = GBA_HEIGHT,
+                .block_w    = GBA_WIDTH,
+                .block_h    = GBA_HEIGHT,
+                .block_offset_x = 0,
+                .block_offset_y = 0,
+                .srm_cm     = PPA_SRM_COLOR_MODE_RGB565,
+            },
+            .out = {
+                .buffer       = dst,
+                .buffer_size  = fb_bytes,
+                .pic_w        = PHYS_W,
+                .pic_h        = PHYS_H,
+                .block_offset_x = 0,
+                .block_offset_y = BORDER_Y,
+                .srm_cm       = PPA_SRM_COLOR_MODE_RGB565,
+            },
+            .rotation_angle = PPA_SRM_ROTATION_ANGLE_270,
+            .scale_x        = PPA_SCALE_X,
+            .scale_y        = PPA_SCALE_Y,
+            .mode           = PPA_TRANS_MODE_BLOCKING,
+        };
+        ppa_do_scale_rotate_mirror(ppa_srm_client, &srm);
+
+        // Draw overlays after PPA scale
+        draw_fps_overlay(render_buf[0]);
+
+        if (ss_state == SS_MENU_OPEN)
+            draw_ss_menu(render_buf[0]);
+
+        // Show toast briefly after menu closes
+        if (ss_state == SS_MENU_CLOSED && ss_toast_f > 0)
+            draw_ss_menu(render_buf[0]);
+
+        if (layout_menu_open)
+            draw_layout_menu(render_buf[0], lm_cursor, key_layout);
+
         xSemaphoreGive(sem_scale_done);
-        // Blit to display (overlaps with Core 1's next frames)
-        bsp_display_blit(0, 0, display_h_res, display_v_res, render_buf[cur_buf]);
-        cur_buf ^= 1;
+        bsp_display_blit(0, 0, display_h_res, display_v_res, render_buf[0]);
     }
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-static void restart_to_launcher(void) {
-    bootloader_common_update_rtc_retain_mem(NULL, true);
+void restart_to_launcher(void) {
+    rtc_retain_mem_t *mem = bootloader_common_get_rtc_retain_mem();
+    memset(mem->custom, 0, sizeof(mem->custom));
     esp_restart();
 }
 
-static void blit(void) {
+void blit(void) {
     bsp_display_blit(0, 0, display_h_res, display_v_res, pax_buf_get_pixels(&fb_pax));
 }
 
-// Find first .gba ROM in ROMS_DIR
-static const char *find_rom(void) {
-    static char rom_path[320];
-    DIR *d = opendir(ROMS_DIR);
-    if (!d) return NULL;
-    struct dirent *ent;
-    while ((ent = readdir(d)) != NULL) {
-        size_t len = strlen(ent->d_name);
-        if (len > 4 && strcasecmp(ent->d_name + len - 4, ".gba") == 0) {
-            snprintf(rom_path, sizeof(rom_path), "%s/%s", ROMS_DIR, ent->d_name);
-            closedir(d);
-            return rom_path;
-        }
+// ── Rewind ────────────────────────────────────────────────────────────────────
+
+
+static void save_sram(void) {
+    if (sram_path_global[0]) {
+        gpsp_write_save(sram_path_global);
+        ESP_LOGI(TAG, "SRAM saved: %s", sram_path_global);
     }
-    closedir(d);
-    return NULL;
 }
 
-// ── Scale GBA framebuffer (RGB8888) into render buffer (RGB565) ───────────────
+static void save_and_exit_launcher(void) {
+    save_sram();
+    bsp_audio_set_amplifier(false);
+    bsp_audio_set_volume(0);
+    vTaskDelay(pdMS_TO_TICKS(100));
+    restart_to_launcher();
+}
 
-// GBA X (240) → 800 physical rows (3.33x: every 3rd gx gets 4 rows, rest get 3)
-// GBA Y (160, reversed) → 480 physical columns (3x exact)
-// Output is RGB565: 33% less PSRAM bandwidth than RGB888
+static void save_and_return_selector(void) {
+    save_sram();
+    bsp_audio_set_amplifier(false);
+    bsp_audio_set_volume(0);
+    vTaskDelay(pdMS_TO_TICKS(100));
+    // Restart app (without launcher flag → boots back into HowBoyAdvance)
+    esp_restart();
+}
 
-static void scale_frame(uint16_t *dst) {
-    const int stride = PHYS_W;  // 480 pixels per physical row
+// ── Save state operations (inline on Core 1) ─────────────────────────────────
 
-    uint16_t scaled_row[PHYS_W] __attribute__((aligned(4)));
-    int row = 0;
+static void ss_ensure_buf(void) {
+    if (!state_buf)
+        state_buf = heap_caps_malloc(GBA_STATE_BUF_SIZE, MALLOC_CAP_SPIRAM);
+}
 
-    for (int gx = 0; gx < GBA_WIDTH; gx++) {
-        // Build scaled row: each GBA pixel → 3 physical pixels (3x vertical scale)
-        // Read source column bottom-to-top for 90° CW rotation
-        uint16_t *rp = scaled_row;
-        const color_t *src_col = gba_fb + gx;
-
-        for (int gy = GBA_HEIGHT - 1; gy >= 0; gy--) {
-            uint32_t c = src_col[gy * GBA_WIDTH];
-            // Convert RGB888 → RGB565: R[7:3] G[7:2] B[7:3]
-            uint16_t px = ((c & 0xF8) << 8) | (((c >> 8) & 0xFC) << 3) | ((c >> 19) & 0x1F);
-            // Write 3 copies (3x column scaling)
-            rp[0] = px;
-            rp[1] = px;
-            rp[2] = px;
-            rp += 3;
-        }
-
-        // 4-3-3 row duplication pattern (240 → 800)
-        int row_count = (gx % 3 == 0) ? 4 : 3;
-        uint16_t *row_dst = dst + row * stride;
-        memcpy(row_dst, scaled_row, stride * sizeof(uint16_t));
-        for (int rep = 1; rep < row_count; rep++) {
-            memcpy(row_dst + rep * stride, row_dst, stride * sizeof(uint16_t));
-        }
-        row += row_count;
+static void ss_do_save(int slot) {
+    ss_ensure_buf();
+    if (!state_buf) { snprintf(ss_toast, sizeof(ss_toast), "No memory!"); ss_toast_f = 120; ss_state = SS_MENU_CLOSED; return; }
+    gpsp_save_state_buf(state_buf);
+    char path[400];
+    snprintf(path, sizeof(path), "%s.ss%d", state_save_dir, slot);
+    FILE *f = fopen(path, "wb");
+    if (f) {
+        fwrite(state_buf, 1, GBA_STATE_BUF_SIZE, f);
+        fclose(f);
+        ss_exists[slot] = true;
+        snprintf(ss_toast, sizeof(ss_toast), "Slot %d saved!", slot);
+        ESP_LOGI(TAG, "State saved: %s", path);
+    } else {
+        snprintf(ss_toast, sizeof(ss_toast), "Save failed!");
+        ESP_LOGE(TAG, "Failed to save state: %s", path);
     }
+    ss_toast_f = 120;
+    ss_state = SS_MENU_CLOSED;
+}
+
+static void ss_do_load(int slot) {
+    ss_ensure_buf();
+    if (!state_buf) { snprintf(ss_toast, sizeof(ss_toast), "No memory!"); ss_toast_f = 120; ss_state = SS_MENU_CLOSED; return; }
+    char path[400];
+    snprintf(path, sizeof(path), "%s.ss%d", state_save_dir, slot);
+    FILE *f = fopen(path, "rb");
+    if (f) {
+        fread(state_buf, 1, GBA_STATE_BUF_SIZE, f);
+        fclose(f);
+        if (gpsp_load_state_buf(state_buf)) {
+            snprintf(ss_toast, sizeof(ss_toast), "Slot %d loaded!", slot);
+            ESP_LOGI(TAG, "State loaded: %s", path);
+        } else {
+            snprintf(ss_toast, sizeof(ss_toast), "Load failed!");
+            ESP_LOGE(TAG, "Invalid state: %s", path);
+        }
+    } else {
+        snprintf(ss_toast, sizeof(ss_toast), "Slot %d empty!", slot);
+    }
+    ss_toast_f = 120;
+    ss_state = SS_MENU_CLOSED;
+}
+
+static void ss_do_delete(int slot) {
+    char path[400];
+    snprintf(path, sizeof(path), "%s.ss%d", state_save_dir, slot);
+    if (remove(path) == 0) {
+        ss_exists[slot] = false;
+        snprintf(ss_toast, sizeof(ss_toast), "Slot %d deleted!", slot);
+        ESP_LOGI(TAG, "State deleted: %s", path);
+    } else {
+        snprintf(ss_toast, sizeof(ss_toast), "Delete failed!");
+    }
+    ss_toast_f = 120;
+    ss_state = SS_MENU_CLOSED;
 }
 
 // ── Input handling ────────────────────────────────────────────────────────────
@@ -182,50 +382,202 @@ static void scale_frame(uint16_t *dst) {
 #define GBA_KEY_R      (1 << 8)
 #define GBA_KEY_L      (1 << 9)
 
+// Pending save state operation (set by input, executed in main loop)
+static volatile int ss_pending_op = 0;  // 0=none, 1=save, 2=load, 3=delete
+
 static void poll_input(void) {
     bsp_input_event_t ev;
+
+    // Scancode polling for A/B and d-pad (layout-dependent)
+    if (!layout_menu_open) {
+        bool st;
+        if (key_layout == 1) {
+            // WASD layout: WASD = d-pad, semicolon = A, left brace = B
+            bsp_input_read_scancode(BSP_INPUT_SCANCODE_W,         &st); if (st) gba_keys |= GBA_KEY_UP;    else gba_keys &= ~GBA_KEY_UP;
+            bsp_input_read_scancode(BSP_INPUT_SCANCODE_S,         &st); if (st) gba_keys |= GBA_KEY_DOWN;  else gba_keys &= ~GBA_KEY_DOWN;
+            bsp_input_read_scancode(BSP_INPUT_SCANCODE_A,         &st); if (st) gba_keys |= GBA_KEY_LEFT;  else gba_keys &= ~GBA_KEY_LEFT;
+            bsp_input_read_scancode(BSP_INPUT_SCANCODE_D,         &st); if (st) gba_keys |= GBA_KEY_RIGHT; else gba_keys &= ~GBA_KEY_RIGHT;
+            bsp_input_read_scancode(BSP_INPUT_SCANCODE_SEMICOLON, &st); if (st) gba_keys |= GBA_KEY_A;     else gba_keys &= ~GBA_KEY_A;
+            bsp_input_read_scancode(BSP_INPUT_SCANCODE_LEFTBRACE, &st); if (st) gba_keys |= GBA_KEY_B;     else gba_keys &= ~GBA_KEY_B;
+        } else {
+            // Default layout: A = GBA A, D = GBA B (matching HowBoyMatsu)
+            bsp_input_read_scancode(BSP_INPUT_SCANCODE_A, &st); if (st) gba_keys |= GBA_KEY_A; else gba_keys &= ~GBA_KEY_A;
+            bsp_input_read_scancode(BSP_INPUT_SCANCODE_D, &st); if (st) gba_keys |= GBA_KEY_B; else gba_keys &= ~GBA_KEY_B;
+        }
+        // L/R/Start/Select always polled via scancode
+        bsp_input_read_scancode(BSP_INPUT_SCANCODE_Q,     &st); if (st) gba_keys |= GBA_KEY_L;      else gba_keys &= ~GBA_KEY_L;
+        bsp_input_read_scancode(BSP_INPUT_SCANCODE_E,     &st); if (st) gba_keys |= GBA_KEY_R;      else gba_keys &= ~GBA_KEY_R;
+        bsp_input_read_scancode(BSP_INPUT_SCANCODE_ENTER, &st); if (st) gba_keys |= GBA_KEY_START;  else gba_keys &= ~GBA_KEY_START;
+        bsp_input_read_scancode(BSP_INPUT_SCANCODE_SPACE, &st); if (st) gba_keys |= GBA_KEY_SELECT; else gba_keys &= ~GBA_KEY_SELECT;
+    }
+
     while (xQueueReceive(input_event_queue, &ev, 0) == pdTRUE) {
         if (ev.type == INPUT_EVENT_TYPE_NAVIGATION) {
-            uint32_t bit = 0;
-            bool handled = false;
+            int pressed = ev.args_navigation.state;
+
+            // Save state menu input
+            if (ss_state == SS_MENU_OPEN && pressed) {
+                switch (ev.args_navigation.key) {
+                    case BSP_INPUT_NAVIGATION_KEY_UP:
+                        ss_cursor--;
+                        if (ss_cursor < SS_SAVE) ss_cursor = SS_CANCEL;
+                        if ((ss_cursor == SS_LOAD || ss_cursor == SS_DELETE) && !ss_exists[ss_slot])
+                            ss_cursor = SS_SAVE;
+                        break;
+                    case BSP_INPUT_NAVIGATION_KEY_DOWN:
+                        ss_cursor++;
+                        if (ss_cursor > SS_CANCEL) ss_cursor = SS_SAVE;
+                        if ((ss_cursor == SS_LOAD || ss_cursor == SS_DELETE) && !ss_exists[ss_slot])
+                            ss_cursor = SS_CANCEL;
+                        break;
+                    case BSP_INPUT_NAVIGATION_KEY_LEFT:
+                        ss_slot--;
+                        if (ss_slot < 0) ss_slot = 9;
+                        if ((ss_cursor == SS_LOAD || ss_cursor == SS_DELETE) && !ss_exists[ss_slot])
+                            ss_cursor = SS_SAVE;
+                        break;
+                    case BSP_INPUT_NAVIGATION_KEY_RIGHT:
+                        ss_slot++;
+                        if (ss_slot > 9) ss_slot = 0;
+                        if ((ss_cursor == SS_LOAD || ss_cursor == SS_DELETE) && !ss_exists[ss_slot])
+                            ss_cursor = SS_SAVE;
+                        break;
+                    case BSP_INPUT_NAVIGATION_KEY_RETURN:
+                        if (ss_cursor == SS_CANCEL) {
+                            ss_state = SS_MENU_CLOSED;
+                        } else if (ss_cursor == SS_SAVE) {
+                            ss_pending_op = 1;
+                        } else if (ss_cursor == SS_LOAD && ss_exists[ss_slot]) {
+                            ss_pending_op = 2;
+                        } else if (ss_cursor == SS_DELETE && ss_exists[ss_slot]) {
+                            ss_pending_op = 3;
+                        }
+                        break;
+                    case BSP_INPUT_NAVIGATION_KEY_F4:
+                        ss_state = SS_MENU_CLOSED;
+                        break;
+                    default: break;
+                }
+                continue;
+            }
+
+            // Layout menu input
+            if (layout_menu_open && pressed) {
+                switch (ev.args_navigation.key) {
+                    case BSP_INPUT_NAVIGATION_KEY_UP:
+                        lm_cursor = 0; break;
+                    case BSP_INPUT_NAVIGATION_KEY_DOWN:
+                        lm_cursor = 1; break;
+                    case BSP_INPUT_NAVIGATION_KEY_RETURN:
+                        key_layout = lm_cursor;
+                        layout_menu_open = 0;
+                        gba_keys = 0;  // release all keys on layout change
+                        ESP_LOGI(TAG, "Layout: %s", key_layout ? "WASD" : "Default");
+                        break;
+                    case BSP_INPUT_NAVIGATION_KEY_F2:
+                        layout_menu_open = 0; break;
+                    default: break;
+                }
+                continue;
+            }
+
+            // Normal gameplay — d-pad via navigation events (default layout only)
+            if (key_layout == 0) {
+                switch (ev.args_navigation.key) {
+                    case BSP_INPUT_NAVIGATION_KEY_UP:
+                        if (pressed) gba_keys |= GBA_KEY_UP;    else gba_keys &= ~GBA_KEY_UP;    break;
+                    case BSP_INPUT_NAVIGATION_KEY_DOWN:
+                        if (pressed) gba_keys |= GBA_KEY_DOWN;  else gba_keys &= ~GBA_KEY_DOWN;  break;
+                    case BSP_INPUT_NAVIGATION_KEY_LEFT:
+                        if (pressed) gba_keys |= GBA_KEY_LEFT;  else gba_keys &= ~GBA_KEY_LEFT;  break;
+                    case BSP_INPUT_NAVIGATION_KEY_RIGHT:
+                        if (pressed) gba_keys |= GBA_KEY_RIGHT; else gba_keys &= ~GBA_KEY_RIGHT; break;
+                    default: break;
+                }
+            }
+
+            // System keys (always active)
             switch (ev.args_navigation.key) {
-                case BSP_INPUT_NAVIGATION_KEY_UP:    bit = GBA_KEY_UP;    handled = true; break;
-                case BSP_INPUT_NAVIGATION_KEY_DOWN:  bit = GBA_KEY_DOWN;  handled = true; break;
-                case BSP_INPUT_NAVIGATION_KEY_LEFT:  bit = GBA_KEY_LEFT;  handled = true; break;
-                case BSP_INPUT_NAVIGATION_KEY_RIGHT: bit = GBA_KEY_RIGHT; handled = true; break;
-                case BSP_INPUT_NAVIGATION_KEY_F1:
-                    if (ev.args_navigation.state) restart_to_launcher();
+                case BSP_INPUT_NAVIGATION_KEY_ESC:
+                    if (pressed) save_and_exit_launcher();
                     break;
+
+                case BSP_INPUT_NAVIGATION_KEY_BACKSPACE:
+                    if (pressed) save_and_return_selector();
+                    break;
+
+                case BSP_INPUT_NAVIGATION_KEY_VOLUME_UP:
+                    if (pressed) {
+                        volume_level += 5.0f;
+                        if (volume_level > 100.0f) volume_level = 100.0f;
+                        bsp_audio_set_volume(volume_level);
+                        ESP_LOGI(TAG, "Volume: %.0f%%", volume_level);
+                    }
+                    break;
+                case BSP_INPUT_NAVIGATION_KEY_VOLUME_DOWN:
+                    if (pressed) {
+                        volume_level -= 5.0f;
+                        if (volume_level < 0.0f) volume_level = 0.0f;
+                        bsp_audio_set_volume(volume_level);
+                        ESP_LOGI(TAG, "Volume: %.0f%%", volume_level);
+                    }
+                    break;
+
+                case BSP_INPUT_NAVIGATION_KEY_F1:
+                    if (pressed && ss_state == SS_MENU_CLOSED && !layout_menu_open) {
+                        gpsp_reset();
+                        ESP_LOGI(TAG, "Soft reset");
+                    }
+                    break;
+
+                case BSP_INPUT_NAVIGATION_KEY_F2:
+                    if (pressed && ss_state == SS_MENU_CLOSED) {
+                        lm_cursor = key_layout;
+                        layout_menu_open = 1;
+                    }
+                    break;
+
+                case BSP_INPUT_NAVIGATION_KEY_F4:
+                    if (pressed && ss_state == SS_MENU_CLOSED && !layout_menu_open &&
+                        state_save_dir[0]) {
+                        for (int si = 0; si < 10; si++) {
+                            char spath[400];
+                            snprintf(spath, sizeof(spath), "%s.ss%d", state_save_dir, si);
+                            struct stat st;
+                            ss_exists[si] = (stat(spath, &st) == 0);
+                        }
+                        ss_cursor = SS_SAVE;
+                        ss_state  = SS_MENU_OPEN;
+                    }
+                    break;
+
+
+                case BSP_INPUT_NAVIGATION_KEY_F6:
+                    if (pressed) {
+                        ff_speed = (ff_speed + 1) % 3;
+                        ESP_LOGI(TAG, "FF: %s", (const char*[]){"OFF","5x","8x"}[ff_speed]);
+                    }
+                    break;
+
                 default: break;
             }
-            if (handled) {
-                if (ev.args_navigation.state)
-                    gba_keys |= bit;
-                else
-                    gba_keys &= ~bit;
+
+        } else if (ev.type == INPUT_EVENT_TYPE_KEYBOARD) {
+            // Backtick toggles FPS overlay
+            if (ev.args_keyboard.ascii == '`') {
+                show_fps = !show_fps;
+                if (!show_fps) {
+                    uint16_t *p = (uint16_t *)render_buf[0];
+                    if (p) {
+                        for (int r = 770; r < 800; r++)
+                            for (int c = 0; c < 30; c++)
+                                p[r * PHYS_W + c] = 0;
+                    }
+                }
             }
         }
     }
-
-    bool st;
-    bsp_input_read_scancode(BSP_INPUT_SCANCODE_X,     &st); if (st) gba_keys |= GBA_KEY_A;      else gba_keys &= ~GBA_KEY_A;
-    bsp_input_read_scancode(BSP_INPUT_SCANCODE_Z,     &st); if (st) gba_keys |= GBA_KEY_B;      else gba_keys &= ~GBA_KEY_B;
-    bsp_input_read_scancode(BSP_INPUT_SCANCODE_Q,     &st); if (st) gba_keys |= GBA_KEY_L;      else gba_keys &= ~GBA_KEY_L;
-    bsp_input_read_scancode(BSP_INPUT_SCANCODE_E,     &st); if (st) gba_keys |= GBA_KEY_R;      else gba_keys &= ~GBA_KEY_R;
-    bsp_input_read_scancode(BSP_INPUT_SCANCODE_ENTER, &st); if (st) gba_keys |= GBA_KEY_START;  else gba_keys &= ~GBA_KEY_START;
-    bsp_input_read_scancode(BSP_INPUT_SCANCODE_SPACE, &st); if (st) gba_keys |= GBA_KEY_SELECT; else gba_keys &= ~GBA_KEY_SELECT;
 }
-
-// ── mGBA logging callback ─────────────────────────────────────────────────────
-
-static void mgba_log(struct mLogger *logger, int category, enum mLogLevel level, const char *format, va_list args) {
-    (void)logger; (void)category;
-    if (level & (mLOG_ERROR | mLOG_FATAL)) {
-        esp_log_writev(ESP_LOG_ERROR, "mGBA", format, args);
-    }
-}
-
-static struct mLogger mgba_logger = { .log = mgba_log };
 
 // ── Emulator task (Core 1) ────────────────────────────────────────────────────
 
@@ -258,7 +610,7 @@ static void emulator_task(void *arg) {
             ESP_LOGE(TAG, "SD mount failed: %s", esp_err_to_name(ret));
             pax_background(&fb_pax, 0xFF000000);
             pax_draw_text(&fb_pax, 0xFFFF0000, pax_font_sky_mono, 16, 10, 10, "SD card mount failed!");
-            pax_draw_text(&fb_pax, 0xFFAAAAAA, pax_font_sky_mono, 12, 10, 40, "Press F1 to return");
+            pax_draw_text(&fb_pax, 0xFFAAAAAA, pax_font_sky_mono, 12, 10, 40, "Press ESC to return");
             blit();
             goto wait_exit;
         }
@@ -267,154 +619,246 @@ static void emulator_task(void *arg) {
     }
 sd_ready:;
 
-    // ── Find ROM ─────────────────────────────────────────────────────────
-    const char *rom_path = find_rom();
-    if (!rom_path) {
+    // ── Select ROM ────────────────────────────────────────────────────────
+    scan_roms();
+    const char *rom_path;
+    if (rom_count == 0) {
         pax_background(&fb_pax, 0xFF000000);
         pax_draw_text(&fb_pax, 0xFFFF0000, pax_font_sky_mono, 16, 10, 10, "No GBA ROMs found!");
         pax_draw_text(&fb_pax, 0xFFAAAAAA, pax_font_sky_mono, 12, 10, 40, "Place .gba files in /sdcard/roms/");
-        pax_draw_text(&fb_pax, 0xFFAAAAAA, pax_font_sky_mono, 12, 10, 70, "Press F1 to return");
+        pax_draw_text(&fb_pax, 0xFFAAAAAA, pax_font_sky_mono, 12, 10, 70, "Press ESC to return");
         blit();
         goto wait_exit;
+    } else {
+        rom_path = rom_selector();
+        if (!rom_path) goto wait_exit;
     }
 
     ESP_LOGI(TAG, "Loading ROM: %s", rom_path);
     pax_background(&fb_pax, 0xFF000000);
-    pax_draw_text(&fb_pax, 0xFFFFFF00, pax_font_sky_mono, 14, 10, 10, "Loading ROM...");
+    pax_draw_text(&fb_pax, 0xFFFFFF00, pax_font_sky_mono, 14, 10, 10, "Loading ROM (gpSP)...");
     blit();
 
-    // ── Initialize mGBA core ─────────────────────────────────────────────
-    mLogSetDefaultLogger(&mgba_logger);
-
-    core = GBACoreCreate();
-    if (!core) {
-        ESP_LOGE(TAG, "Failed to create GBA core");
-        goto wait_exit;
-    }
-    core->init(core);
-    mCoreInitConfig(core, NULL);
-
-    // Minimize audio processing overhead (we don't output audio yet)
-    core->setAudioBufferSize(core, 4096);
-    // Disable all 6 audio channels (4 PSG + 2 DMA)
-    for (int ch = 0; ch < 6; ch++) {
-        core->enableAudioChannel(core, ch, false);
-    }
-
-    // Allocate GBA framebuffer from internal RAM (150KB — saves PSRAM for ROM)
-    gba_fb = heap_caps_malloc(GBA_WIDTH * GBA_HEIGHT * sizeof(color_t), MALLOC_CAP_INTERNAL);
-    if (!gba_fb) {
-        ESP_LOGE(TAG, "Failed to allocate GBA framebuffer");
-        goto wait_exit;
-    }
-    memset(gba_fb, 0, GBA_WIDTH * GBA_HEIGHT * sizeof(color_t));
-    core->setVideoBuffer(core, gba_fb, GBA_WIDTH);
-
-    // Free PAX buffer to maximize PSRAM for ROM mapping
+    // Free PAX buffer to maximize PSRAM for ROM
     pax_buf_destroy(&fb_pax);
 
-    // Load ROM
-    struct VFile *vf = VFileFOpen(rom_path, "rb");
-    if (!vf || !core->loadROM(core, vf)) {
-        ESP_LOGE(TAG, "mGBA failed to load ROM (free PSRAM: %u)",
-                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
-        pax_buf_init(&fb_pax, NULL, display_h_res, display_v_res, PAX_BUF_16_565RGB);
-        pax_buf_reversed(&fb_pax, display_data_endian == BSP_DISPLAY_ENDIAN_BIG);
-        pax_buf_set_orientation(&fb_pax, PAX_O_ROT_CW);
-        pax_background(&fb_pax, 0xFF000000);
-        pax_draw_text(&fb_pax, 0xFFFF0000, pax_font_sky_mono, 16, 10, 10, "Failed to load ROM!");
-        pax_draw_text(&fb_pax, 0xFFAAAAAA, pax_font_sky_mono, 12, 10, 40, "ROM may be too large for PSRAM");
-        blit();
-        goto wait_exit;
-    }
-    ESP_LOGI(TAG, "ROM loaded via VFile: %s (free PSRAM: %u)", rom_path,
-             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
-
-    // Re-create PAX buffer for error messages only (not used for game rendering)
-    pax_buf_init(&fb_pax, NULL, display_h_res, display_v_res, PAX_BUF_16_565RGB);
-    pax_buf_reversed(&fb_pax, display_data_endian == BSP_DISPLAY_ENDIAN_BIG);
-    pax_buf_set_orientation(&fb_pax, PAX_O_ROT_CW);
-
-    // Allocate double render buffers in PSRAM for blit task
+    // Allocate render buffer BEFORE ROM load (avoids PSRAM fragmentation)
     {
-        size_t fb_size = PHYS_W * PHYS_H * 2;  // RGB565: 2 bytes per pixel
-        render_buf[0] = heap_caps_malloc(fb_size, MALLOC_CAP_SPIRAM);
-        render_buf[1] = heap_caps_malloc(fb_size, MALLOC_CAP_SPIRAM);
-        if (!render_buf[0] || !render_buf[1]) {
-            ESP_LOGE(TAG, "Failed to allocate render buffers");
+        size_t fb_size = PHYS_W * PHYS_H * 2;
+        render_buf[0] = heap_caps_aligned_alloc(64, fb_size, MALLOC_CAP_SPIRAM);
+        if (!render_buf[0]) {
+            ESP_LOGE(TAG, "Failed to allocate render buffer");
             goto wait_exit;
         }
         memset(render_buf[0], 0, fb_size);
-        memset(render_buf[1], 0, fb_size);
+        ESP_LOGI(TAG, "Render buf allocated: %u bytes", (unsigned)fb_size);
+    }
+
+    // Save state buffer allocated on-demand when needed (saves 416KB PSRAM for ROM)
+
+
+    // ── Initialize gpSP ──────────────────────────────────────────────────
+    if (!gpsp_init()) {
+        ESP_LOGE(TAG, "gpSP init failed");
+        goto wait_exit;
+    }
+
+    if (gpsp_load_rom(rom_path) != 0) {
+        ESP_LOGE(TAG, "gpSP failed to load ROM (free PSRAM: %u)",
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+        goto wait_exit;
+    }
+    ESP_LOGI(TAG, "ROM loaded via gpSP: %s (free PSRAM: %u)", rom_path,
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+
+    // Derive save/state paths from ROM filename
+    mkdir(SAVES_DIR, 0777);
+    {
+        const char *base = strrchr(rom_path, '/');
+        base = base ? base + 1 : rom_path;
+        snprintf(sram_path_global, sizeof(sram_path_global), "%s/%s", SAVES_DIR, base);
+        char *dot = strrchr(sram_path_global, '.');
+        if (dot) strcpy(dot, ".sav");
+        gpsp_load_save(sram_path_global);
+        ESP_LOGI(TAG, "Save file: %s", sram_path_global);
+
+        // State save dir: /sdcard/saves/ROMNAME (no extension)
+        snprintf(state_save_dir, sizeof(state_save_dir), "%s/%s", SAVES_DIR, base);
+        dot = strrchr(state_save_dir, '.');
+        if (dot) *dot = '\0';
+    }
+
+
+    // Initialize PPA hardware scaler
+    {
+        ppa_client_config_t ppa_cfg = {
+            .oper_type = PPA_OPERATION_SRM,
+            .max_pending_trans_num = 1,
+        };
+        esp_err_t ret = ppa_register_client(&ppa_cfg, &ppa_srm_client);
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "PPA init failed: %s", esp_err_to_name(ret));
+            goto wait_exit;
+        }
+        ESP_LOGI(TAG, "PPA scaler initialized (%.4fx/%.1fx + 90 CW -> %dx%d centered in %dx%d)",
+                 PPA_SCALE_X, PPA_SCALE_Y, SCALED_W, SCALED_H, PHYS_W, PHYS_H);
     }
 
     // Start blit task on Core 0
     sem_frame_ready = xSemaphoreCreateBinary();
     sem_scale_done  = xSemaphoreCreateBinary();
-    xSemaphoreGive(sem_scale_done);  // Allow first render frame to proceed
+    xSemaphoreGive(sem_scale_done);
     xTaskCreatePinnedToCore(blit_task, "blit", 4096, NULL, 6, NULL, 0);
 
-    // Set up save file
-    mkdir(SAVES_DIR, 0777);
+    // Initialize audio pipeline
     {
-        char save_path[320];
-        const char *base = strrchr(rom_path, '/');
-        base = base ? base + 1 : rom_path;
-        snprintf(save_path, sizeof(save_path), "%s/%s", SAVES_DIR, base);
-        char *dot = strrchr(save_path, '.');
-        if (dot) strcpy(dot, ".sav");
-        struct VFile *save_vf = VFileOpen(save_path, O_CREAT | O_RDWR);
-        if (save_vf) {
-            core->loadSave(core, save_vf);
-            ESP_LOGI(TAG, "Save file: %s", save_path);
+        size_t buf_bytes = AUDIO_DRAIN_MAX * 2 * sizeof(int16_t);
+        audio_buf_a = malloc(buf_bytes);
+        audio_buf_b = malloc(buf_bytes);
+        sem_audio_ready = xSemaphoreCreateBinary();
+        sem_audio_done  = xSemaphoreCreateBinary();
+        if (audio_buf_a && audio_buf_b && sem_audio_ready && sem_audio_done) {
+            xSemaphoreGive(sem_audio_done);
+            xTaskCreatePinnedToCore(audio_task, "audio", 4096, NULL, 7, NULL, 0);
+            bsp_audio_set_rate(AUDIO_SAMPLE_RATE);
+            // Pre-fill I2S DMA with silence to build buffer ahead (reduces underrun risk)
+            {
+                i2s_chan_handle_t i2s_pre = NULL;
+                bsp_audio_get_i2s_handle(&i2s_pre);
+                if (i2s_pre) {
+                    int16_t silence[512] = {0};
+                    size_t wr;
+                    for (int i = 0; i < 4; i++)
+                        i2s_channel_write(i2s_pre, silence, sizeof(silence), &wr, pdMS_TO_TICKS(50));
+                }
+            }
+            bsp_audio_set_volume(volume_level);
+            bsp_audio_set_amplifier(true);
+            ESP_LOGI(TAG, "Audio initialized: %d Hz stereo", AUDIO_SAMPLE_RATE);
+        } else {
+            ESP_LOGW(TAG, "Audio disabled: allocation failed");
+            free(audio_buf_a); audio_buf_a = NULL;
+            free(audio_buf_b); audio_buf_b = NULL;
         }
     }
 
-    // Use mGBA's built-in frameskip: renderer is skipped for N frames,
-    // then renders 1 frame. Skipped frames bypass drawScanline entirely.
-    core->opts.frameskip = 1;
+    // Lock CPU to max frequency
+    esp_pm_lock_handle_t pm_lock;
+    esp_pm_lock_create(ESP_PM_CPU_FREQ_MAX, 0, "emu", &pm_lock);
+    esp_pm_lock_acquire(pm_lock);
 
-    // Enable idle loop detection: mGBA auto-detects when the CPU is spinning
-    // in a tight loop waiting for an interrupt and fast-forwards those cycles.
-    // Critical for Pokemon and other games that idle-wait for VBlank.
-    mCoreConfigSetValue(&core->config, "idleOptimization", "detect");
-
-    core->reset(core);
-    ESP_LOGI(TAG, "mGBA core initialized — starting emulation");
+    ESP_LOGI(TAG, "gpSP core initialized — starting emulation");
 
     // ── Main emulation loop ──────────────────────────────────────────────
-    // mGBA frameskip=1: render, skip, render, skip... (counter starts at 0)
-    // Core 1: render frame → signal Core 0 → skip frame (overlaps with scale)
-    // Core 0: scale gba_fb → signal done → blit to display
     {
-        int64_t frame_start = esp_timer_get_time();
+        // GBA frame period: 280896 cycles / 16.78MHz ≈ 16742.7 µs ≈ 59.7275 Hz
+        #define FRAME_PERIOD_US  16743
+        extern uint32_t skip_next_frame;
+        int64_t fps_timer = esp_timer_get_time();
+        int64_t next_frame = fps_timer;
         int frame_count = 0;
+        int total_frames = 0;
 
         while (1) {
-            poll_input();
-            core->setKeys(core, gba_keys);
+            // Handle pending save state operations (must run on Core 1)
+            if (ss_pending_op) {
+                int op = ss_pending_op;
+                int slot = ss_slot;
+                ss_pending_op = 0;
+                if (op == 1) ss_do_save(slot);
+                else if (op == 2) ss_do_load(slot);
+                else if (op == 3) ss_do_delete(slot);
+            }
 
-            // Wait for Core 0 to finish reading gba_fb from previous iteration
+            poll_input();
+
+            // ── Normal emulation ──────────────────────────────────────
+            gpsp_set_buttons(gba_keys);
+
+            int frame_was_skipped = skip_next_frame;
+
+            // Wait for PPA to finish reading gba_fb from previous frame
             xSemaphoreTake(sem_scale_done, portMAX_DELAY);
 
-            // Rendered frame (mGBA counter=0: draws all scanlines + finishFrame)
-            core->runFrame(core);
+            // Run one frame of emulation
+            gba_fb = gpsp_run_frame();
 
-            // Signal Core 0 to scale gba_fb (safe: skip frame won't touch it)
-            xSemaphoreGive(sem_frame_ready);
+            if (!frame_was_skipped) {
+                // Flush framebuffer from D-cache so PPA DMA sees updated pixels
+                esp_cache_msync(gba_fb, GBA_WIDTH * GBA_HEIGHT * sizeof(uint16_t),
+                                ESP_CACHE_MSYNC_FLAG_DIR_C2M);
+                // Signal blit task to PPA scale + display
+                xSemaphoreGive(sem_frame_ready);
+            } else {
+                // Skipped render — no blit needed, re-grant permission
+                xSemaphoreGive(sem_scale_done);
+            }
+            drain_and_submit_audio();
 
-            // Skip frame (mGBA counter=1: CPU only, no renderer)
-            // Core 0 scales gba_fb in parallel during this time
-            core->runFrame(core);
+            // Fast forward: skip frame pacing entirely
+            static int ff_frame = 0;
+            static const int ff_skip[] = {0, 4, 7};
+            if (ff_speed > 0) {
+                int skip = ff_skip[ff_speed];
+                ff_frame++;
+                if (ff_frame > skip) {
+                    ff_frame = 0;
+                    skip_next_frame = 0;
+                } else {
+                    skip_next_frame = 1;
+                }
+                // No frame pacing during FF
+                frame_count++;
+                total_frames++;
+                int64_t now = esp_timer_get_time();
+                if (now - fps_timer >= 1000000) {
+                    fps_val = frame_count;
+                    ESP_LOGI(TAG, "FPS: %d (FF %s)", fps_val,
+                             (const char*[]){"OFF","5x","8x"}[ff_speed]);
+                    frame_count = 0;
+                    fps_timer = now;
+                }
+                // Reset frame pacing deadline
+                next_frame = esp_timer_get_time();
+                continue;
+            }
+            ff_frame = 0;
 
-            frame_count += 2;
+            // Frame pacing + auto frameskip
+            next_frame += FRAME_PERIOD_US;
             int64_t now = esp_timer_get_time();
-            if (now - frame_start >= 1000000) {
+            int64_t wait_us = next_frame - now;
+
+            if (wait_us > 1000) {
+                vTaskDelay(pdMS_TO_TICKS(wait_us / 1000));
+            }
+
+            // Auto frameskip: if behind, skip next render (never 2 in a row)
+            if (wait_us < 0 && !frame_was_skipped) {
+                skip_next_frame = 1;
+            } else {
+                skip_next_frame = 0;
+            }
+
+            // Reset deadline if too far behind
+            if (next_frame < now - FRAME_PERIOD_US * 3)
+                next_frame = now;
+
+            frame_count++;
+            total_frames++;
+            now = esp_timer_get_time();
+            if (now - fps_timer >= 1000000) {
                 fps_val = frame_count;
-                ESP_LOGI(TAG, "Emulated FPS: %d (displayed: %d)",
-                         fps_val, fps_val / 2);
+                ESP_LOGI(TAG, "FPS: %d", fps_val);
+                audio_samples_produced = 0;
                 frame_count = 0;
-                frame_start = esp_timer_get_time();
+                fps_timer = now;
+            }
+
+
+            // Autosave SRAM every ~5 minutes (~18000 frames at 60fps)
+            if (total_frames % 18000 == 0 && total_frames > 0) {
+                save_sram();
             }
         }
     }
@@ -425,7 +869,7 @@ wait_exit:;
         while (1) {
             if (xQueueReceive(input_event_queue, &ev, portMAX_DELAY) == pdTRUE) {
                 if (ev.type == INPUT_EVENT_TYPE_NAVIGATION &&
-                    ev.args_navigation.key == BSP_INPUT_NAVIGATION_KEY_F1 &&
+                    ev.args_navigation.key == BSP_INPUT_NAVIGATION_KEY_ESC &&
                     ev.args_navigation.state)
                     restart_to_launcher();
             }
@@ -466,24 +910,16 @@ void app_main(void) {
         case BSP_DISPLAY_ROTATION_270: orientation = PAX_O_ROT_CCW;  break;
         default: break;
     }
+
     pax_buf_init(&fb_pax, NULL, display_h_res, display_v_res, format);
     pax_buf_reversed(&fb_pax, display_data_endian == BSP_DISPLAY_ENDIAN_BIG);
     pax_buf_set_orientation(&fb_pax, orientation);
 
     ESP_ERROR_CHECK(bsp_input_get_queue(&input_event_queue));
 
-    // Splash screen
     pax_background(&fb_pax, 0xFF000000);
-    pax_draw_text(&fb_pax, 0xFF00FF00, pax_font_sky_mono, 24, 10, 10,  "HowBoyAdvance");
-    pax_draw_text(&fb_pax, 0xFFFFFFFF, pax_font_sky_mono, 14, 10, 50,  "Game Boy Advance Emulator");
-    pax_draw_text(&fb_pax, 0xFFAAAAAA, pax_font_sky_mono, 12, 10, 80,  "for Tanmatsu");
-    pax_draw_text(&fb_pax, 0xFFFFFF00, pax_font_sky_mono, 12, 10, 120, "Loading...");
+    pax_draw_text(&fb_pax, 0xFF00FF00, pax_font_sky_mono, 16, 10, 10, "HowBoyAdvance (gpSP)");
     blit();
-    vTaskDelay(pdMS_TO_TICKS(500));
 
-    xTaskCreatePinnedToCore(emulator_task, "emulator", 32768, NULL, 5, &emulator_task_handle, 1);
-
-    while (1) {
-        vTaskDelay(pdMS_TO_TICKS(10000));
-    }
+    xTaskCreatePinnedToCore(emulator_task, "emu", 48 * 1024, NULL, 5, &emulator_task_handle, 1);
 }

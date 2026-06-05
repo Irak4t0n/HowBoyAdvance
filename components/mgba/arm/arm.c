@@ -8,6 +8,7 @@
 #include <mgba/internal/arm/isa-arm.h>
 #include <mgba/internal/arm/isa-inlines.h>
 #include <mgba/internal/arm/isa-thumb.h>
+#include "jit-riscv.h"
 
 void ARMSetPrivilegeMode(struct ARMCore* cpu, enum PrivilegeMode mode) {
 	if (mode == cpu->privilegeMode) {
@@ -237,6 +238,11 @@ void ARMRun(struct ARMCore* cpu) {
 }
 
 void ARMRunLoop(struct ARMCore* cpu) {
+	/* Try JIT for Thumb mode first; falls through to interpreter for
+	   any remaining cycles (ARM mode, invalid PC, etc.) */
+	if (cpu->executionMode == MODE_THUMB && jit_state && jit_state->active) {
+		jit_run_thumb(cpu, jit_state);
+	}
 	if (cpu->executionMode == MODE_THUMB) {
 		while (cpu->cycles < cpu->nextEvent) {
 			ThumbStep(cpu);

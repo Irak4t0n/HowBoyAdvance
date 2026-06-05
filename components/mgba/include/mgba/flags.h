@@ -6,8 +6,10 @@
 #define MINIMAL_CORE 2
 #endif
 
-// Use 32-bit color natively (we convert to display format ourselves)
-// Do NOT define COLOR_16_BIT — we want 32-bit XBGR8 output from mGBA
+// Native RGB565 output from mGBA — matches display format directly.
+// Halves framebuffer size (76.8KB vs 153.6KB) and eliminates format conversion.
+#define COLOR_16_BIT
+#define COLOR_5_6_5
 
 // Disable threading (we manage our own tasks via FreeRTOS)
 #define DISABLE_THREADING

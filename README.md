@@ -13,35 +13,54 @@ Sister project to [HowBoyMatsu](https://github.com/Irak4t0n/HowBoyMatsu) (Game B
 
 ## Emulator
 
-Uses [mGBA](https://mgba.io/) 0.10.4 core for GBA emulation.
+Uses [gpSP](https://github.com/libretro/gpsp) with a custom RISC-V dynamic recompiler (dynarec) for GBA emulation.
 
-- GBA screen (240x160) scaled to full 800x480 landscape display
-  - 240 columns mapped to 800 rows (3.33x, pattern: 4-3-3 repeating)
-  - 160 rows mapped to 480 columns (3x uniform)
-- Software renderer, 32-bit color converted to RGB565 for display
-- mGBA built-in frameskip (1 skip per rendered frame) — renderer bypassed on skip frames
-- Idle loop detection auto-detects and fast-forwards CPU idle waits
-- Dual-core pipeline: Core 1 emulates, Core 0 scales + blits in parallel
-- Optimized ROM loading: staged reads through internal DMA RAM (~7 MB/s)
+- **RISC-V dynarec**: JIT compiles ARM/Thumb → native RISC-V for ~2x speedup over interpreter
+- GBA screen (240x160) scaled to full 800x480 via PPA hardware scaler (3.3x/3.0x + rotation)
+- Audio output at 65536 Hz (gpSP native rate) via I2S to ES8156 codec
+- Dual-core pipeline: Core 1 emulates, Core 0 PPA scales + blits
+- ROM page-swapping from SD card for ROMs larger than available PSRAM cache
 - Save files stored on SD card at `/sdcard/saves/`
+- Save states stored at `/sdcard/saves/*.ss0` through `.ss9`
 
 ## Controls
 
+### Default Layout
 | GBA Button | Tanmatsu Key |
 |------------|-------------|
-| A          | X           |
-| B          | Z           |
+| A          | A           |
+| B          | D           |
 | L          | Q           |
 | R          | E           |
 | Start      | Enter       |
 | Select     | Space       |
 | D-pad      | Arrow keys  |
-| Return to launcher | F1 |
+
+### WASD Layout (F2 to switch)
+| GBA Button | Tanmatsu Key |
+|------------|-------------|
+| A          | ; (semicolon) |
+| B          | [ (bracket)   |
+| D-pad      | WASD          |
+
+### System Keys
+| Function | Key |
+|----------|-----|
+| Soft reset | F1 |
+| Layout switcher | F2 |
+| Save state menu | F4 |
+| Fast forward (OFF/5x/8x) | F6 |
+| FPS overlay | ` (backtick) |
+| Volume up | Volume Up |
+| Volume down | Volume Down |
+| Return to ROM selector | Backspace |
+| Exit to launcher | ESC |
 
 ## Usage
 
 1. Place `.gba` ROM files in `/sdcard/roms/` on the SD card
 2. Launch HowBoyAdvance from the Tanmatsu app menu
+3. Select a ROM from the on-screen file browser
 
 ## Build
 
@@ -54,31 +73,32 @@ make build DEVICE=tanmatsu
 
 # Upload (put Tanmatsu in badgelink mode first)
 make install DEVICE=tanmatsu
-
-# Or manually:
-cd badgelink/tools && source .venv/bin/activate && \
-python badgelink.py appfs upload howboyadvance "HowBoyAdvance" 0 ../../build/tanmatsu/application.bin
-
-# Monitor serial output
-make monitor DEVICE=tanmatsu PORT=/dev/ttyACM0
 ```
 
 Windows users can also use `build.bat` and `upload.bat` helpers.
 
 ## Architecture
 
-- **main/main.c** - Application entry point, ROM loading, emulation loop, input handling, display scaling
-- **components/mgba/** - mGBA 0.10.4 core (ARM/Thumb CPU, GBA hardware emulation, software renderer)
-  - `util/vfs/vfs-file.c` - Virtual filesystem with optimized staged SD card reads
-  - `util/memory.c` - Memory allocation routing large buffers to PSRAM
-  - `gb/audio.c` - GB audio (PSG shared by GBA audio subsystem)
+- **main/main.c** - Application entry, ROM selector, emulation loop, input, display, audio
+- **main/rom_selector.c** - On-screen ROM file browser
+- **main/menu.c** - Save state and layout menu overlays (5x7 bitmap font)
+- **main/config.h** - Shared constants (screen dimensions, menu layout)
+- **components/gpsp/** - gpSP emulator core with RISC-V dynarec
+  - `riscv/riscv_codegen.h` - RISC-V machine code generation
+  - `riscv/riscv_emit.h` - JIT block emission (ARM/Thumb → RISC-V)
+  - `riscv/riscv_stub.S` - Register file, entry/exit stubs
+  - `gpsp_esp.c` - ESP32-P4 integration (JIT cache mapping, ROM loading)
+  - `gpsp_memory_alloc.c` - Large arrays in PSRAM via EXT_RAM_BSS_ATTR
+
+## Performance
+
+~49-69 FPS on Pokemon Emerald with RISC-V dynarec.
 
 ## Known Issues
 
-- Always delete `build/tanmatsu/esp-idf/main/libmain.a` before rebuilding to force recompilation
-- 32MB ROMs do not fit in PSRAM (16MB and smaller work fine)
-- FPS varies by scene complexity (~30-76 emulated FPS, ~15-38 displayed)
+- Audio is functional but has some crackling artifacts
+- 32MB ROMs work via page-swapping but may have brief hitches on cache misses
 
 ## License
 
-mGBA is licensed under the Mozilla Public License 2.0.
+gpSP is licensed under the GNU General Public License v2.0.
