@@ -80,9 +80,11 @@ static volatile int         audio_buf_len = 0;
 static volatile int         audio_buf_ready = 0;
 static SemaphoreHandle_t    sem_audio_ready = NULL;
 static SemaphoreHandle_t    sem_audio_done  = NULL;
-static volatile int         audio_samples_produced = 0;
 static float                volume_level = 50.0f;
 static volatile int         audio_mute = 0;
+
+// Our own I2S handle (recreated with larger DMA buffers)
+static i2s_chan_handle_t    emu_i2s = NULL;
 
 // Fast forward
 static volatile int  ff_speed = 0;
@@ -115,8 +117,6 @@ static SemaphoreHandle_t sem_scale_done  = NULL;
 // ── Audio task (Core 0) ──────────────────────────────────────────────────────
 
 static void audio_task(void *arg) {
-    i2s_chan_handle_t i2s = NULL;
-    bsp_audio_get_i2s_handle(&i2s);
     size_t written;
     static int16_t silence[2048] = {0};
 
@@ -124,16 +124,16 @@ static void audio_task(void *arg) {
         xSemaphoreTake(sem_audio_ready, portMAX_DELAY);
         if (audio_mute) {
             // Write silence to keep I2S DMA flowing (prevents pops on unmute)
-            if (i2s)
-                i2s_channel_write(i2s, silence, audio_buf_len * 2 * sizeof(int16_t),
+            if (emu_i2s)
+                i2s_channel_write(emu_i2s, silence, audio_buf_len * 2 * sizeof(int16_t),
                                   &written, pdMS_TO_TICKS(100));
             xSemaphoreGive(sem_audio_done);
             continue;
         }
         int16_t *buf = (audio_buf_ready == 0) ? audio_buf_a : audio_buf_b;
         int len = audio_buf_len;
-        if (len > 0 && i2s)
-            i2s_channel_write(i2s, buf, len * 2 * sizeof(int16_t),
+        if (len > 0 && emu_i2s)
+            i2s_channel_write(emu_i2s, buf, len * 2 * sizeof(int16_t),
                               &written, pdMS_TO_TICKS(100));
         xSemaphoreGive(sem_audio_done);
     }
@@ -158,11 +158,21 @@ static void drain_and_submit_audio(void) {
     }
 
     unsigned frames = gpsp_get_audio(buf, AUDIO_FRAMES_PER_VBLANK);
-    // Pad remainder with silence so I2S always gets a full frame — prevents DMA underruns
-    if (frames < AUDIO_FRAMES_PER_VBLANK)
+    if (frames < AUDIO_FRAMES_PER_VBLANK) {
+        // Fade out last 32 stereo frames to avoid click at audio→silence boundary
+        if (frames >= 2) {
+            int fade_len = (frames < 32) ? (int)frames : 32;
+            for (int j = 0; j < fade_len; j++) {
+                int idx = (int)(frames - fade_len + j) * 2;
+                int scale = fade_len - 1 - j;  // ramps down to 0
+                buf[idx]     = (int16_t)((int32_t)buf[idx]     * scale / (fade_len - 1));
+                buf[idx + 1] = (int16_t)((int32_t)buf[idx + 1] * scale / (fade_len - 1));
+            }
+        }
+        // Pad remainder with silence
         memset(buf + frames * 2, 0, (AUDIO_FRAMES_PER_VBLANK - frames) * 2 * sizeof(int16_t));
-    audio_samples_produced += frames;
-    // Block up to 30ms for previous buffer to finish — prevents dropped audio
+    }
+    // Block up to 30ms for previous buffer to finish
     xSemaphoreTake(sem_audio_done, pdMS_TO_TICKS(30));
     audio_buf_len = AUDIO_FRAMES_PER_VBLANK;
     audio_buf_ready ^= 1;
@@ -718,20 +728,46 @@ sd_ready:;
         sem_audio_ready = xSemaphoreCreateBinary();
         sem_audio_done  = xSemaphoreCreateBinary();
         if (audio_buf_a && audio_buf_b && sem_audio_ready && sem_audio_done) {
+            // Recreate I2S channel with larger DMA buffers for smoother audio.
+            // BSP default is dma_desc_num=6, dma_frame_num=240 (~22ms at 65536 Hz).
+            // We use 8x550 = ~67ms of buffer to absorb frame timing jitter.
+            i2s_chan_handle_t bsp_i2s = NULL;
+            bsp_audio_get_i2s_handle(&bsp_i2s);
+            if (bsp_i2s) {
+                i2s_channel_disable(bsp_i2s);
+                i2s_del_channel(bsp_i2s);
+            }
+            i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(0, I2S_ROLE_MASTER);
+            chan_cfg.dma_desc_num = 8;
+            chan_cfg.dma_frame_num = 550;
+            esp_err_t i2s_err = i2s_new_channel(&chan_cfg, &emu_i2s, NULL);
+            if (i2s_err == ESP_OK) {
+                i2s_std_config_t i2s_cfg = {
+                    .clk_cfg  = I2S_STD_CLK_DEFAULT_CONFIG(AUDIO_SAMPLE_RATE),
+                    .slot_cfg = I2S_STD_MSB_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO),
+                    .gpio_cfg = {
+                        .mclk = BSP_I2S_MCLK,
+                        .bclk = BSP_I2S_BCLK,
+                        .ws   = BSP_I2S_WS,
+                        .dout = BSP_I2S_DOUT,
+                        .din  = I2S_GPIO_UNUSED,
+                        .invert_flags = { .mclk_inv = false, .bclk_inv = false, .ws_inv = false },
+                    },
+                };
+                i2s_channel_init_std_mode(emu_i2s, &i2s_cfg);
+                i2s_channel_enable(emu_i2s);
+                // Pre-fill DMA with silence to build buffer ahead
+                int16_t silence[512] = {0};
+                size_t wr;
+                for (int i = 0; i < 8; i++)
+                    i2s_channel_write(emu_i2s, silence, sizeof(silence), &wr, pdMS_TO_TICKS(50));
+                ESP_LOGI(TAG, "I2S recreated: %d Hz, DMA 8x550 (~67ms buffer)", AUDIO_SAMPLE_RATE);
+            } else {
+                ESP_LOGE(TAG, "I2S recreate failed: %s", esp_err_to_name(i2s_err));
+            }
+
             xSemaphoreGive(sem_audio_done);
             xTaskCreatePinnedToCore(audio_task, "audio", 4096, NULL, 7, NULL, 0);
-            bsp_audio_set_rate(AUDIO_SAMPLE_RATE);
-            // Pre-fill I2S DMA with silence to build buffer ahead (reduces underrun risk)
-            {
-                i2s_chan_handle_t i2s_pre = NULL;
-                bsp_audio_get_i2s_handle(&i2s_pre);
-                if (i2s_pre) {
-                    int16_t silence[512] = {0};
-                    size_t wr;
-                    for (int i = 0; i < 4; i++)
-                        i2s_channel_write(i2s_pre, silence, sizeof(silence), &wr, pdMS_TO_TICKS(50));
-                }
-            }
             bsp_audio_set_volume(volume_level);
             bsp_audio_set_amplifier(true);
             ESP_LOGI(TAG, "Audio initialized: %d Hz stereo", AUDIO_SAMPLE_RATE);
@@ -850,7 +886,6 @@ sd_ready:;
             if (now - fps_timer >= 1000000) {
                 fps_val = frame_count;
                 ESP_LOGI(TAG, "FPS: %d", fps_val);
-                audio_samples_produced = 0;
                 frame_count = 0;
                 fps_timer = now;
             }

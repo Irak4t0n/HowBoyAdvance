@@ -828,12 +828,35 @@ u32 sound_read_samples(s16 *out, u32 frames)
 
       sound_buffer[source_index] = 0;
 
-      if(current_sample > 2047)
-         current_sample = 2047;
-      if(current_sample < -2048)
-         current_sample = -2048;
+      /* Two-segment soft clipper, smooth everywhere (C1 continuous):
+       *
+       * Segment 1 (|s| <= 4096): cubic y = (3x - x³)/2, x = s/4096
+       *   Output range ±24576, gain ~9x at center, slope 0 at boundary.
+       *
+       * Segment 2 (4096 < |s| <= 6144): Hermite cubic extension
+       *   Smoothly compresses from ±24576 to ±32767 with slope 0 at
+       *   both ends. Covers worst-case 2 DMA + 4 GBC channels (~±5900).
+       *
+       * No hard clipping within the GBA's possible output range. */
+      s32 s = current_sample;
+      s32 abs_s = (s >= 0) ? s : -s;
+      s32 out_val;
 
-      out[i] = current_sample * 16;
+      if(abs_s <= 4096)
+      {
+         s32 q = 50331648 - s * s;   /* 3 * 4096² - s² */
+         out_val = (s32)(((s64)s * q * 24576LL) >> 37);
+      }
+      else
+      {
+         if(abs_s > 6144) abs_s = 6144;
+         s32 u = abs_s - 4096;        /* 0..2048 */
+         s64 h = (s64)u * u * (6144 - 2 * u);
+         s32 ext = (s32)((8191LL * h) >> 33);
+         out_val = (s >= 0) ? (24576 + ext) : (-24576 - ext);
+      }
+
+      out[i] = (s16)(out_val * 3 >> 2);
    }
 
    sound_buffer_base += samples_to_read;

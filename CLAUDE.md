@@ -41,12 +41,15 @@ Uses gpSP core with RISC-V dynarec for GBA emulation.
 - Sister project HowBoyMatsu (C:\Users\Howar\HowBoyMatsu) is the reference for Tanmatsu hardware compatibility
 - Always update DEVLOG.md, README.md, and CLAUDE.md with every commit
 
-## Current State (Session 4)
+## Current State (Session 5)
 
 - Switched from mGBA interpreter to gpSP with RISC-V dynarec (~49-69 FPS)
 - Full feature set: save states (F4), FPS overlay, fast forward (F6), soft reset (F1),
   layout switcher (F2), volume control, ROM selector, exit to launcher (ESC), autosave SRAM
-- Audio output working (65536 Hz I2S) but has some crackling
+- Audio quality greatly improved: soft clipper, larger DMA buffers, fade-out padding, volume scaling
+- I2S recreated with 8×550 frame DMA (~67ms buffer) to prevent underruns
+- Two-segment cubic soft clipper in sound.c replaces hard clip (no distortion)
+- Digital signal scaled to 75% (×3>>2) for comfortable max volume
 - PSRAM optimized: on-demand save state buf, reduced JIT cache (1MB+256KB)
-- Rewind (F5) attempted but removed — needs ~20MB PSRAM, doesn't fit with 16MB ROMs
-- RTC "battery dry" fix attempted but removed — settimeofday pulls in too much libc BSS
+- Launcher icon: make_icon.py generates GBA-shaped pixel art, metadata.json for app store
+- App store entry: com.irak4t0n.howboyadvance in app-repository

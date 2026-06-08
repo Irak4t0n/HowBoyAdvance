@@ -17,7 +17,7 @@ Uses [gpSP](https://github.com/libretro/gpsp) with a custom RISC-V dynamic recom
 
 - **RISC-V dynarec**: JIT compiles ARM/Thumb → native RISC-V for ~2x speedup over interpreter
 - GBA screen (240x160) scaled to full 800x480 via PPA hardware scaler (3.3x/3.0x + rotation)
-- Audio output at 65536 Hz (gpSP native rate) via I2S to ES8156 codec
+- Audio output at 65536 Hz via I2S to ES8156 codec with soft clipping
 - Dual-core pipeline: Core 1 emulates, Core 0 PPA scales + blits
 - ROM page-swapping from SD card for ROMs larger than available PSRAM cache
 - Save files stored on SD card at `/sdcard/saves/`
@@ -96,7 +96,6 @@ Windows users can also use `build.bat` and `upload.bat` helpers.
 
 ## Known Issues
 
-- Audio is functional but has some crackling artifacts
 - 32MB ROMs work via page-swapping but may have brief hitches on cache misses
 
 ## License

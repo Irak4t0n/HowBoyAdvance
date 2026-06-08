@@ -56,6 +56,32 @@
 - `-nostdlib++` linker flag prevents libstdc++ BSS overflow
 - `-Wl,--no-check-sections` for irom/drom VMA overlap
 
+## 2026-06-08: Audio Quality Fix + Launcher Icon
+
+### Audio Improvements
+- **Replaced hard clipper with two-segment cubic soft clipper** in `sound.c`
+  - Segment 1 (|s| ≤ 4096): cubic y=(3x-x³)/2 with ~9x gain, output ±24576
+  - Segment 2 (4096 < |s| ≤ 6144): Hermite extension to ±32767
+  - Covers full GBA audio range (~±5900 worst case) without hard clipping
+- **Recreated I2S with larger DMA buffers**: 8×550 frames (~67ms) vs BSP default (~22ms)
+  - Eliminates DMA underrun crackling during brief frame drops
+- **Fade-out before silence padding**: 32-frame linear fade prevents click artifacts
+- **Digital volume scaling**: output × 3/4 (-2.5dB) for comfortable max volume at 100%
+- **Removed dynamic sample rate control** (caused i2s_channel_reconfig errors)
+
+### Launcher Icon
+- `make_icon.py` — Generates 16x16, 32x32, 64x64 pixel art GBA icons (no dependencies)
+- `metadata.json` — App store metadata with icon references
+- GBA-shaped design: indigo body, green screen, shoulder buttons, d-pad, A/B buttons
+- Published to app-repository as `com.irak4t0n.howboyadvance`
+
+### Files Changed
+- `components/gpsp/sound.c` — soft clipper + 75% volume scaling
+- `main/main.c` — I2S recreation, fade-out padding, removed set_volume helper
+- `make_icon.py` — new file, icon generator
+- `metadata.json` — new file, app store metadata
+- `icon-*.png` — new files, launcher icons
+
 ## 2026-05-18: Performance Optimization Pass
 
 ### Changes
