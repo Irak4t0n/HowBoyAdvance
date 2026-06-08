@@ -41,6 +41,7 @@
 #include "config.h"
 #include "menu.h"
 
+
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 static char const TAG[] = "howboy";
