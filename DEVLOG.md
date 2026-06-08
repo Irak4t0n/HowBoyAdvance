@@ -27,7 +27,7 @@
 - Still has some crackling — likely DMA underruns at sub-60fps
 
 ### Emulator Features (matching HowBoyMatsu)
-- **ROM selector**: On-screen file browser at `/sdcard/roms/`
+- **ROM selector**: On-screen file browser at `/sdcard/roms/`, supports up to 256 ROMs (alphabetically sorted)
 - **Save states** (F4): 10 slots, 416KB BSON format, on-demand buffer allocation
 - **FPS overlay** (backtick): Red digit overlay in corner
 - **Fast forward** (F6): Cycles OFF → 5x → 8x

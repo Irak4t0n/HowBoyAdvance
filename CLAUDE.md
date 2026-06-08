@@ -41,7 +41,7 @@ Uses gpSP core with RISC-V dynarec for GBA emulation.
 - Sister project HowBoyMatsu (C:\Users\Howar\HowBoyMatsu) is the reference for Tanmatsu hardware compatibility
 - Always update DEVLOG.md, README.md, and CLAUDE.md with every commit
 
-## Current State (Session 5)
+## Current State (Session 6)
 
 - Switched from mGBA interpreter to gpSP with RISC-V dynarec (~49-69 FPS)
 - Full feature set: save states (F4), FPS overlay, fast forward (F6), soft reset (F1),
@@ -53,3 +53,4 @@ Uses gpSP core with RISC-V dynarec for GBA emulation.
 - PSRAM optimized: on-demand save state buf, reduced JIT cache (1MB+256KB)
 - Launcher icon: make_icon.py generates GBA-shaped pixel art, metadata.json for app store
 - App store entry: com.irak4t0n.howboyadvance in app-repository
+- ROM selector: increased MAX_ROMS from 64 to 256, alphabetical sorting, rom_list in PSRAM

@@ -1,5 +1,7 @@
 #include "rom_selector.h"
 
+#include <stdlib.h>
+#include "esp_attr.h"
 #include <string.h>
 #include <dirent.h>
 #include "esp_log.h"
@@ -20,7 +22,7 @@ void blit(void);
 void restart_to_launcher(void);
 
 // ── ROM list ──────────────────────────────────────────────────────────────────
-char rom_list[MAX_ROMS][300];
+EXT_RAM_BSS_ATTR char rom_list[MAX_ROMS][300];
 int  rom_count = 0;
 
 // ── 5x7 bitmap font for direct-pixel text rendering ──────────────────────────
@@ -195,6 +197,8 @@ void scan_roms(void) {
         }
     }
     closedir(dir);
+    qsort(rom_list, rom_count, sizeof(rom_list[0]),
+          (int (*)(const void *, const void *))strcasecmp);
     ESP_LOGI("rom_selector", "Found %d ROMs", rom_count);
 }
 

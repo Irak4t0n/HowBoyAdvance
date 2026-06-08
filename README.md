@@ -80,7 +80,7 @@ Windows users can also use `build.bat` and `upload.bat` helpers.
 ## Architecture
 
 - **main/main.c** - Application entry, ROM selector, emulation loop, input, display, audio
-- **main/rom_selector.c** - On-screen ROM file browser
+- **main/rom_selector.c** - On-screen ROM file browser (up to 256 ROMs, alphabetically sorted)
 - **main/menu.c** - Save state and layout menu overlays (5x7 bitmap font)
 - **main/config.h** - Shared constants (screen dimensions, menu layout)
 - **components/gpsp/** - gpSP emulator core with RISC-V dynarec
